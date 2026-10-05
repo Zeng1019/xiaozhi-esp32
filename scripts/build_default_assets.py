@@ -792,6 +792,16 @@ def get_emoji_collection_path(default_emoji_collection, noto_fonts_path, project
         else:
             print("Warning: project_root not provided, cannot locate otto-gif collection")
             return None
+
+    # claw-face: repo-owned animated GIF collection (neon sci-fi robot eyes)
+    if default_emoji_collection == 'claw-face':
+        base = project_root or os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+        claw_path = os.path.join(base, 'main', 'assets', 'emoji', 'claw-face')
+        if os.path.exists(claw_path):
+            return claw_path
+        print(f"Warning: claw-face emoji collection directory not found: {claw_path}")
+        return None
     
     # Try PNG emoji collections first.
     emoji_path = os.path.join(noto_fonts_path, 'png', default_emoji_collection)
