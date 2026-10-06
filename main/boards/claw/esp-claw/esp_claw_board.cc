@@ -17,6 +17,13 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
+#include <nvs.h>
+#include <time.h>
+#include <freertos/semphr.h>
+#include <vector>
+#include <string>
+#include <atomic>
+#include <cstring>
 
 #include "usb/usb_host.h"
 #include "esp_video_init.h"
@@ -307,6 +314,139 @@ private:
         ESP_LOGI(TAG, "Continuous-rotation servo ready on GPIO%d (neutral = stopped)", CLAW_SERVO_GPIO);
     }
 
+    // ---- Persistent reminders (NVS) that make the device speak when due ----
+    // Daily reminders fire once per calendar day at HH:MM; interval reminders
+    // re-fire every N minutes. On fire the device opens an audio session and
+    // sends the message text as if spoken, so the cloud AI answers by voice.
+    static constexpr int kMaxReminders = 4;
+    struct ClawReminder {
+        uint8_t type;            // 0 = daily HH:MM, 1 = every interval_min
+        uint8_t hour;            // daily: 0-23
+        uint8_t minute;          // daily: 0-59
+        uint16_t interval_min;   // interval type: period in minutes
+        char message[64];        // what the reminder is about (UTF-8)
+        uint16_t last_fired_yday;// daily dedup: day-of-year already fired
+        time_t next_due;         // interval type: earliest fire time
+    };
+    std::vector<ClawReminder> reminders_;
+    SemaphoreHandle_t reminders_mutex_ = nullptr;
+    std::atomic<bool> test_fire_{false};  // set by the test tool: fire reminders_[0] once idle
+    static constexpr uint16_t kYdayNever = 0xFFFF;
+
+    void LoadReminders() {
+        nvs_handle_t h;
+        if (nvs_open("claw_rem", NVS_READONLY, &h) != ESP_OK) return;
+        size_t len = 0;
+        if (nvs_get_blob(h, "entries", nullptr, &len) == ESP_OK && len >= sizeof(ClawReminder)) {
+            int count = len / sizeof(ClawReminder);
+            if (count > kMaxReminders) count = kMaxReminders;
+            auto* buf = new ClawReminder[count];
+            if (nvs_get_blob(h, "entries", buf, &len) == ESP_OK) {
+                reminders_.assign(buf, buf + count);
+            }
+            delete[] buf;
+        }
+        nvs_close(h);
+        ESP_LOGI(TAG, "Loaded %d reminder(s) from NVS", (int)reminders_.size());
+    }
+
+    void SaveReminders() {
+        nvs_handle_t h;
+        if (nvs_open("claw_rem", NVS_READWRITE, &h) != ESP_OK) return;
+        if (reminders_.empty()) {
+            nvs_erase_key(h, "entries");  // missing key is fine on first run
+        } else {
+            nvs_set_blob(h, "entries", reminders_.data(),
+                         reminders_.size() * sizeof(ClawReminder));
+        }
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    // UTF-8 aware clip: never cut in the middle of a multi-byte character.
+    static std::string Utf8Clip(const std::string& s, size_t max_bytes) {
+        if (s.size() <= max_bytes) return s;
+        size_t cut = max_bytes;
+        while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
+        return s.substr(0, cut);
+    }
+
+    // The cloud only accepts SHORT text in the wake-word "detect" message
+    // (long text is rejected with "Detector is only for wake words. Don't
+    // send long ..."), and a short non-wake-word text is forwarded to the
+    // LLM as a one-shot question, so the AI answers the reminder by voice.
+    void FireReminder(const ClawReminder& r) {
+        std::string msg = Utf8Clip(std::string(r.message), 27);  // <= 9 CJK chars
+        std::string prompt = msg.empty() ? "喝水时间到了" : "提醒：" + msg;
+        if (prompt.size() > 36) prompt = Utf8Clip(prompt, 36);   // <= 12 CJK chars
+        ESP_LOGI(TAG, "Reminder due: %s (prompt: %s)", r.message, prompt.c_str());
+        // Full message on screen in case the voice flow is interrupted.
+        GetDisplay()->ShowNotification(("提醒：" + std::string(r.message)).c_str(), 5000);
+        Application::GetInstance().WakeWordInvoke(prompt);
+    }
+
+    static void ReminderTask(void* arg) {
+        auto* self = static_cast<EspClawBoard*>(arg);
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(2 * 1000));
+            time_t now = time(nullptr);
+            struct tm lt;
+            localtime_r(&now, &lt);
+            if (lt.tm_year + 1900 < 2026) {
+                continue;  // SNTP not synced yet; never fire on bogus time
+            }
+            bool dirty = false;
+            xSemaphoreTake(self->reminders_mutex_, portMAX_DELAY);
+            // Test tool request: fire reminders_[0] once, with the same
+            // bookkeeping as a real fire so it does not re-fire right after.
+            // Consume the flag only when we actually fire (&& short-circuits),
+            // so a request made mid-conversation survives until the device
+            // goes idle.
+            if (self->GetDeviceStateSafe() == kDeviceStateIdle &&
+                !self->reminders_.empty() &&
+                self->test_fire_.exchange(false)) {
+                auto& tr = self->reminders_.front();
+                if (tr.type == 0) tr.last_fired_yday = lt.tm_yday;
+                else tr.next_due = now + (time_t)tr.interval_min * 60;
+                dirty = true;
+                self->FireReminder(tr);
+            }
+            for (auto& r : self->reminders_) {
+                if (r.type == 0) {
+                    // Daily at HH:MM, once per calendar day
+                    if (lt.tm_hour == r.hour && lt.tm_min == r.minute &&
+                        r.last_fired_yday != lt.tm_yday &&
+                        self->GetDeviceStateSafe() == kDeviceStateIdle) {
+                        r.last_fired_yday = lt.tm_yday;
+                        self->FireReminder(r);
+                    }
+                } else {
+                    // Every N minutes; skip while busy, catch up once free
+                    if (now >= r.next_due &&
+                        self->GetDeviceStateSafe() == kDeviceStateIdle) {
+                        r.next_due = now + (time_t)r.interval_min * 60;
+                        dirty = true;  // persist the advanced next_due
+                        self->FireReminder(r);
+                    }
+                }
+            }
+            xSemaphoreGive(self->reminders_mutex_);
+            if (dirty) self->SaveReminders();
+        }
+    }
+
+    // WakeWordInvoke requires the device to be idle; check from this task
+    DeviceState GetDeviceStateSafe() {
+        return Application::GetInstance().GetDeviceState();
+    }
+
+    void InitializeReminders() {
+        reminders_mutex_ = xSemaphoreCreateMutex();
+        LoadReminders();
+        xTaskCreate(ReminderTask, "claw_remind", 4096, this, 1, nullptr);
+        ESP_LOGI(TAG, "Reminder engine started");
+    }
+
     void RegisterMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
 
@@ -409,6 +549,134 @@ private:
                 ESP_LOGI(TAG, "Servo stopped");
                 return true;
             });
+
+        // --- Persistent reminders (survive reboot, stored in NVS) ---
+        mcp_server.AddTool("self.reminder.add_daily",
+            "Create a DAILY reminder. At hour:minute every day the device will "
+            "speak the message aloud (e.g. drink water, take medicine). "
+            "Max 4 reminders total.",
+            PropertyList({
+                Property("hour", kPropertyTypeInteger, 0, 23),
+                Property("minute", kPropertyTypeInteger, 0, 59),
+                Property("message", kPropertyTypeString).SetMaxLength(63),
+            }), [this](const PropertyList& properties) -> ReturnValue {
+                xSemaphoreTake(reminders_mutex_, portMAX_DELAY);
+                if (reminders_.size() >= kMaxReminders) {
+                    xSemaphoreGive(reminders_mutex_);
+                    return std::string("失败：提醒数量已达上限(4个)，请先删除一些");
+                }
+                ClawReminder r = {};
+                r.type = 0;
+                r.hour = properties["hour"].value<int>();
+                r.minute = properties["minute"].value<int>();
+                r.last_fired_yday = kYdayNever;
+                r.next_due = 0;
+                strncpy(r.message, properties["message"].value<std::string>().c_str(),
+                        sizeof(r.message) - 1);
+                reminders_.push_back(r);
+                SaveReminders();
+                int index = (int)reminders_.size() - 1;
+                xSemaphoreGive(reminders_mutex_);
+                char buf[160];
+                snprintf(buf, sizeof(buf), "已设置每天 %02d:%02d 的提醒(编号%d)：%s",
+                         r.hour, r.minute, index, r.message);
+                ESP_LOGI(TAG, "%s", buf);
+                return std::string(buf);
+            });
+
+        mcp_server.AddTool("self.reminder.add_interval",
+            "Create an INTERVAL reminder that repeats every N minutes "
+            "(e.g. drink water every 60 minutes). It keeps repeating until "
+            "removed. Max 4 reminders total.",
+            PropertyList({
+                Property("minutes", kPropertyTypeInteger, 10, 1440),
+                Property("message", kPropertyTypeString).SetMaxLength(63),
+            }), [this](const PropertyList& properties) -> ReturnValue {
+                xSemaphoreTake(reminders_mutex_, portMAX_DELAY);
+                if (reminders_.size() >= kMaxReminders) {
+                    xSemaphoreGive(reminders_mutex_);
+                    return std::string("失败：提醒数量已达上限(4个)，请先删除一些");
+                }
+                ClawReminder r = {};
+                r.type = 1;
+                r.interval_min = properties["minutes"].value<int>();
+                r.last_fired_yday = kYdayNever;
+                r.next_due = time(nullptr) + (time_t)r.interval_min * 60;
+                strncpy(r.message, properties["message"].value<std::string>().c_str(),
+                        sizeof(r.message) - 1);
+                reminders_.push_back(r);
+                SaveReminders();
+                int index = (int)reminders_.size() - 1;
+                xSemaphoreGive(reminders_mutex_);
+                char buf[192];
+                snprintf(buf, sizeof(buf), "已设置每 %d 分钟的提醒(编号%d)：%s，首次在 %d 分钟后",
+                         r.interval_min, index, r.message, r.interval_min);
+                ESP_LOGI(TAG, "%s", buf);
+                return std::string(buf);
+            });
+
+        mcp_server.AddTool("self.reminder.list",
+            "List all active reminders with their index numbers.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                std::string out;
+                xSemaphoreTake(reminders_mutex_, portMAX_DELAY);
+                if (reminders_.empty()) {
+                    out = "当前没有任何提醒";
+                } else {
+                    out = "共 " + std::to_string(reminders_.size()) + " 个提醒：";
+                    for (int i = 0; i < (int)reminders_.size(); ++i) {
+                        char buf[128];
+                        if (reminders_[i].type == 0) {
+                            snprintf(buf, sizeof(buf), "\n%d. 每天 %02d:%02d：%s",
+                                     i, reminders_[i].hour, reminders_[i].minute,
+                                     reminders_[i].message);
+                        } else {
+                            snprintf(buf, sizeof(buf), "\n%d. 每 %d 分钟：%s",
+                                     i, reminders_[i].interval_min, reminders_[i].message);
+                        }
+                        out += buf;
+                    }
+                }
+                xSemaphoreGive(reminders_mutex_);
+                return out;
+            });
+
+        mcp_server.AddTool("self.reminder.remove",
+            "Delete one reminder by its index number (see reminder list).",
+            PropertyList({
+                Property("index", kPropertyTypeInteger, 0, kMaxReminders - 1),
+            }), [this](const PropertyList& properties) -> ReturnValue {
+                int index = properties["index"].value<int>();
+                std::string out;
+                xSemaphoreTake(reminders_mutex_, portMAX_DELAY);
+                if (index < 0 || index >= (int)reminders_.size()) {
+                    out = "失败：编号 " + std::to_string(index) + " 不存在，请先查询提醒列表";
+                } else {
+                    out = "已删除提醒：" + std::string(reminders_[index].message);
+                    reminders_.erase(reminders_.begin() + index);
+                    SaveReminders();
+                }
+                xSemaphoreGive(reminders_mutex_);
+                ESP_LOGI(TAG, "%s", out.c_str());
+                return out;
+            });
+
+        mcp_server.AddTool("self.reminder.test",
+            "Fire the FIRST reminder immediately as a test (once the device is "
+            "idle). Use this to verify reminders work instead of waiting for "
+            "the real schedule. Does not create or delete reminders.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                bool has;
+                xSemaphoreTake(reminders_mutex_, portMAX_DELAY);
+                has = !reminders_.empty();
+                xSemaphoreGive(reminders_mutex_);
+                if (!has) {
+                    return std::string("失败：当前没有任何提醒可测试");
+                }
+                test_fire_.store(true);
+                ESP_LOGI(TAG, "Test fire requested");
+                return std::string("好的，设备空闲时会立即播报一次提醒，请注意听");
+            });
     }
 
     void InitializeButtons() {
@@ -430,6 +698,7 @@ public:
         InitializeLedStrip();
         InitializeServo();
         RegisterMcpTools();
+        InitializeReminders();
         GetBacklight()->RestoreBrightness();
     }
 
