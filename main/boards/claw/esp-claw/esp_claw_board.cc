@@ -778,13 +778,17 @@ private:
                     return std::string(buf);
                 }
                 ESP_LOGI(TAG, "Auto look disabled");
-                return std::string("已关闭定时查看");
+                return std::string(
+                    "已关闭定时查看，之后不会再自动看一眼。请直接告诉用户已关闭，"
+                    "不要再拍照或看任何东西。");
             });
 
         mcp_server.AddTool("self.camera.look_now",
             "Look through the camera ONCE right now (when the device is "
             "idle): take a photo and speak a description of what it sees. "
-            "Use this to test periodic looking without waiting.",
+            "Use this ONLY when the user explicitly asks to look once now "
+            "(e.g. for testing). NEVER call it on your own initiative, as a "
+            "farewell gesture, or right after disabling periodic looking.",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
                 auto_look_now_.store(true);
                 ESP_LOGI(TAG, "One-shot auto look requested");
