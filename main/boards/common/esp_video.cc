@@ -252,16 +252,34 @@ EspVideo::EspVideo(const esp_video_init_config_t& config) {
         }
     };
 #endif
-    while (ioctl(video_fd_, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
-        ESP_LOGD(TAG, "VIDIOC_ENUM_FMT: pixelformat=0x%08lx, description=%s", fmtdesc.pixelformat,
-                 fmtdesc.description);
-        CAM_PRINT_FOURCC(fmtdesc.pixelformat);
-        int rank = get_rank(fmtdesc.pixelformat);
-        if (rank < best_rank) {
-            best_rank = rank;
-            best_fmt = fmtdesc.pixelformat;
+    // UVC: right after esp_video_init the class driver may not have claimed
+    // the camera interface / cached its format descriptors yet, so ENUM_FMT
+    // can return an empty list and the old code gave up for the whole
+    // session. Retry for a few seconds before declaring failure.
+    const int max_probe_attempts = (config.usb_uvc != nullptr) ? 25 : 1;
+    for (int attempt = 0; attempt < max_probe_attempts; ++attempt) {
+        fmtdesc.index = 0;
+        best_fmt = 0;
+        best_rank = 1 << 30;
+        while (ioctl(video_fd_, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
+            ESP_LOGD(TAG, "VIDIOC_ENUM_FMT: pixelformat=0x%08lx, description=%s", fmtdesc.pixelformat,
+                     fmtdesc.description);
+            CAM_PRINT_FOURCC(fmtdesc.pixelformat);
+            int rank = get_rank(fmtdesc.pixelformat);
+            if (rank < best_rank) {
+                best_rank = rank;
+                best_fmt = fmtdesc.pixelformat;
+            }
+            fmtdesc.index++;
         }
-        fmtdesc.index++;
+        if (best_rank < (1 << 29)) {
+            break;
+        }
+        if (attempt + 1 < max_probe_attempts) {
+            ESP_LOGW(TAG, "no supported pixel format yet, retrying (%d/%d)",
+                     attempt + 1, max_probe_attempts);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
     }
     if (best_rank < (1 << 29)) {
         setformat.fmt.pix.pixelformat = best_fmt;
