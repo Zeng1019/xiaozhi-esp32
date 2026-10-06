@@ -53,5 +53,4 @@ public:
     virtual bool SetHMirror(bool enabled) override;
     virtual bool SetVFlip(bool enabled) override;
     virtual std::expected<std::string, std::string> Explain(const std::string& question) override;
-    virtual std::expected<std::string, std::string> UploadPhotoTo(const std::string& url) override;
 };
