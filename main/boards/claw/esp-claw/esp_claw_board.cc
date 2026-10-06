@@ -447,6 +447,84 @@ private:
         ESP_LOGI(TAG, "Reminder engine started");
     }
 
+    // ---- Auto photo (NVS persisted): periodically capture a JPEG and upload
+    // it to a small receiver program running on the user's PC over WiFi, so
+    // photos are archived as files instead of being transient like the cloud
+    // take_photo flow. Fires only while the device is idle. ----
+    std::atomic<bool> auto_photo_en_{false};
+    std::atomic<uint16_t> auto_photo_interval_{0};  // minutes, 0 = off
+    std::atomic<bool> auto_photo_now_{false};       // one-shot test request
+    char auto_photo_url_[192] = "http://192.168.3.127:8899/upload";
+    time_t photo_next_due_ = 0;
+
+    void LoadAutoPhoto() {
+        nvs_handle_t h;
+        if (nvs_open("claw_photo", NVS_READONLY, &h) != ESP_OK) return;
+        size_t len = sizeof(auto_photo_url_);
+        nvs_get_str(h, "url", auto_photo_url_, &len);
+        uint16_t iv = 0;
+        uint8_t en = 0;
+        if (nvs_get_u16(h, "interval", &iv) == ESP_OK) auto_photo_interval_.store(iv);
+        if (nvs_get_u8(h, "en", &en) == ESP_OK) auto_photo_en_.store(en != 0);
+        nvs_close(h);
+        ESP_LOGI(TAG, "Auto photo: %s, every %u min, url=%s",
+                 auto_photo_en_.load() ? "enabled" : "disabled",
+                 auto_photo_interval_.load(), auto_photo_url_);
+    }
+
+    void SaveAutoPhoto() {
+        nvs_handle_t h;
+        if (nvs_open("claw_photo", NVS_READWRITE, &h) != ESP_OK) return;
+        nvs_set_str(h, "url", auto_photo_url_);
+        nvs_set_u16(h, "interval", auto_photo_interval_.load());
+        nvs_set_u8(h, "en", auto_photo_en_.load() ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    std::string TakeAndUploadPhoto() {
+        if (camera_ == nullptr) return "失败：摄像头未初始化";
+        if (auto_photo_url_[0] == '\0') return "失败：未配置电脑接收地址";
+        if (!camera_->Capture()) return "失败：拍照失败";
+        auto res = camera_->UploadPhotoTo(auto_photo_url_);
+        if (!res) {
+            ESP_LOGE(TAG, "Auto photo upload failed: %s", res.error().c_str());
+            return "失败：照片上传失败";
+        }
+        ESP_LOGI(TAG, "Auto photo saved: %s", res->c_str());
+        return "已保存：" + *res;
+    }
+
+    static void AutoPhotoTask(void* arg) {
+        auto* self = static_cast<EspClawBoard*>(arg);
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(2 * 1000));
+            if (self->GetDeviceStateSafe() != kDeviceStateIdle) continue;
+            bool one_shot = self->auto_photo_now_.exchange(false);
+            bool scheduled = false;
+            if (self->auto_photo_en_.load() && self->auto_photo_interval_.load() > 0 &&
+                time(nullptr) >= self->photo_next_due_) {
+                scheduled = true;
+            }
+            if (!one_shot && !scheduled) continue;
+            std::string out = self->TakeAndUploadPhoto();
+            bool failed = out.rfind("失败", 0) == 0;
+            int mins = self->auto_photo_interval_.load();
+            if (mins < 1) mins = 1;
+            // On failure retry in 60s so a temporarily asleep PC recovers fast;
+            // on success schedule the next shot a full interval away.
+            self->photo_next_due_ =
+                time(nullptr) + (failed ? 60 : (time_t)mins * 60);
+            self->GetDisplay()->ShowNotification(out.c_str(), 4000);
+        }
+    }
+
+    void InitializeAutoPhoto() {
+        LoadAutoPhoto();
+        xTaskCreate(AutoPhotoTask, "claw_photo", 8192, this, 1, nullptr);
+        ESP_LOGI(TAG, "Auto photo engine started");
+    }
+
     void RegisterMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
 
@@ -677,6 +755,49 @@ private:
                 ESP_LOGI(TAG, "Test fire requested");
                 return std::string("好的，设备空闲时会立即播报一次提醒，请注意听");
             });
+
+        // --- Auto photo: periodic capture archived to the user's PC ---
+        mcp_server.AddTool("self.camera.auto_photo",
+            "Enable or disable PERIODIC PHOTO ARCHIVING: the device takes a "
+            "photo every N minutes with its camera and saves it as a jpg file "
+            "on the user's PC (folder E:/esp32/photos). The PC receiver "
+            "program must be running. enable=true starts (first photo is "
+            "taken immediately when idle); enable=false stops. This is "
+            "different from take_photo (which asks the cloud AI to describe "
+            "the image) - auto_photo SAVES photo files.",
+            PropertyList({
+                Property("enable", kPropertyTypeBoolean),
+                Property("minutes", kPropertyTypeInteger, 10, 1, 1440),
+            }), [this](const PropertyList& properties) -> ReturnValue {
+                bool enable = properties["enable"].value<bool>();
+                int minutes = properties["minutes"].value<int>();
+                auto_photo_en_.store(enable);
+                auto_photo_interval_.store((uint16_t)minutes);
+                SaveAutoPhoto();
+                if (enable) {
+                    photo_next_due_ = time(nullptr);  // first shot ASAP when idle
+                    char buf[128];
+                    snprintf(buf, sizeof(buf),
+                             "已开启定时拍照，每 %d 分钟拍一张存到电脑，第一张马上拍", minutes);
+                    ESP_LOGI(TAG, "%s", buf);
+                    return std::string(buf);
+                }
+                ESP_LOGI(TAG, "Auto photo disabled");
+                return std::string("已关闭定时拍照");
+            });
+
+        mcp_server.AddTool("self.camera.photo_now",
+            "Take ONE photo right now (when the device is idle) and save it "
+            "as a jpg file on the user's PC. Use this to test photo archiving "
+            "without waiting for the periodic schedule.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (camera_ == nullptr || auto_photo_url_[0] == '\0') {
+                    return std::string("失败：摄像头或电脑接收地址未配置");
+                }
+                auto_photo_now_.store(true);
+                ESP_LOGI(TAG, "One-shot photo requested");
+                return std::string("好的，马上拍一张存到电脑");
+            });
     }
 
     void InitializeButtons() {
@@ -699,6 +820,7 @@ public:
         InitializeServo();
         RegisterMcpTools();
         InitializeReminders();
+        InitializeAutoPhoto();
         GetBacklight()->RestoreBrightness();
     }
 

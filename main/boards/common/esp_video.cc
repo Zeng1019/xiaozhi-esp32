@@ -1143,3 +1143,22 @@ std::expected<std::string, std::string> EspVideo::Explain(const std::string& que
         (int)frame_.len, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
     return result;
 }
+
+std::expected<std::string, std::string> EspVideo::UploadPhotoTo(const std::string& url) {
+    if (url.empty()) {
+        return std::unexpected("Upload URL is empty");
+    }
+    // Reuse the whole capture->encode->upload path of Explain() by pointing
+    // explain_url_ at the requested destination for the duration of the call,
+    // then restoring it so cloud take_photo keeps working unchanged.
+    // Callers only invoke this while the device is idle, so there is no
+    // concurrent Explain() to race with.
+    std::string saved_url = explain_url_;
+    std::string saved_token = explain_token_;
+    explain_url_ = url;
+    explain_token_ = "";  // LAN receiver needs no auth header
+    auto result = Explain("auto capture");
+    explain_url_ = saved_url;
+    explain_token_ = saved_token;
+    return result;
+}
