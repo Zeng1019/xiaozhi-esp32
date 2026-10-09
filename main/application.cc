@@ -1098,6 +1098,18 @@ void Application::ConfigureWakeWordForListening() {
 #endif
 }
 
+bool Application::PlayNotifyAudio(const std::string& audio_url, const std::string& subtitle) {
+    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
+        return false;
+    }
+    std::vector<NotifySubtitle> subtitles;
+    if (!subtitle.empty()) {
+        subtitles.push_back({0, subtitle});
+    }
+    StartNotification(audio_url, std::move(subtitles));
+    return GetDeviceState() == kDeviceStateNotifying;
+}
+
 void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
         ESP_LOGW(TAG, "Ignoring notify message while device is busy");

@@ -6,6 +6,19 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config CLAW_BRIDGE_URL
+    string "Claw PC bridge server base URL"
+    default ""
+    help
+        Base URL of the esp32-robot-brain bridge server (e.g. http://192.168.1.10:8787).
+        Leave empty to disable the bridge client (photo upload / pending poll).
+
+config CLAW_BRIDGE_TOKEN
+    string "Claw bridge device token"
+    default ""
+    help
+        Shared secret checked by the bridge (X-Device-Token header / token query param).
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

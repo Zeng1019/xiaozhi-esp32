@@ -110,6 +110,10 @@ public:
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
+    // Play a local notification from a streaming audio URL (e.g. a LAN bridge
+    // TTS endpoint) with an optional subtitle. Only succeeds when idle;
+    // returns false when the device is busy (caller may retry later).
+    bool PlayNotifyAudio(const std::string& audio_url, const std::string& subtitle);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);

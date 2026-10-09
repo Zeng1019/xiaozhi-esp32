@@ -28,8 +28,11 @@
 #include "usb/usb_host.h"
 #include "esp_video_init.h"
 #include "esp_video.h"
+#include "jpg/jpeg_to_image.h"
 #include <driver/ledc.h>
 #include <led_strip.h>
+#include <cstdlib>
+#include <cJSON.h>
 
 #define TAG "EspClawBoard"
 
@@ -113,6 +116,7 @@ private:
     Button boot_button_;
     Display* display_ = nullptr;
     Camera* camera_ = nullptr;
+    EspVideo* esp_video_ = nullptr;  // typed alias of camera_ for frame access
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     led_strip_handle_t led_strip_ = nullptr;
@@ -179,6 +183,7 @@ private:
             .usb_uvc = &usb_uvc_config,
         };
         camera_ = new EspVideo(video_config);
+        esp_video_ = static_cast<EspVideo*>(camera_);
         ESP_LOGI(TAG, "USB UVC camera initialized");
     }
 
@@ -517,6 +522,817 @@ private:
         ESP_LOGI(TAG, "Auto look engine started");
     }
 
+    // ---- Desk sentinel (桌面前哨): on-device frame-difference watch. ----
+    // Every N seconds (while the device is idle, so the camera is free) grab
+    // one JPEG frame, decode it and downsample to a 160x90 grayscale map.
+    // Two signals are derived locally (frames never leave the device):
+    //   1. GLOBAL motion grid (16x9 cells)  -> person presence / left-seat
+    //   2. CUP ROI (configurable permille rect) vs a quiet-scene baseline
+    //      -> cup pickup/return/absence events
+    // Policy (user-defined):
+    //   - cup picked up and put back at a NEW spot while the user is present:
+    //     counted as a drink event SILENTLY (no voice, no notification)
+    //   - cup absent for >= sent_cup_absent_ minutes: ONE voice reminder
+    //     "水杯去哪了" per absence episode
+    //   - left-seat detection: logged for now; cloud-confirm wiring is phase 3
+    static constexpr int kSentGW = 160;          // grayscale map width
+    static constexpr int kSentGH = 90;           // grayscale map height
+    // Calibration 2026-10-08 evening: gray~107, sensor noise floor is sparse
+    // hot pixels (davg~3, px10~1400, px20~300, px40~40 over 14400 px, spread
+    // over ~50 of 144 cells with only 3-6 px each). Real motion produces
+    // whole cells at d>=40. Cup spans ~12 ROI cells (1 gray px ~= 0.75 cm).
+    static constexpr int kSentPxTh = 20;         // gray delta that counts as a changed pixel
+    static constexpr int kSentCellActPx = 15;    // changed px in a 10x10 cell => motion cell
+    static constexpr int kSentQuietCells = 2;    // motion_cells <= this => scene quiet
+    static constexpr int kSentHotTh = 4;         // consecutive active cycles => hot cell (masked)
+    static constexpr int kSentRoiCell = 4;       // ROI cell size (gray px, finer grid)
+    static constexpr int kSentRoiActCells = 3;   // changed ROI cells => activity
+    static constexpr int kSentRoiGoneCells = 6;  // changed ROI cells => cup likely gone
+    static constexpr int kSentMeanShift = 3;     // ROI mean shift => cup left the ROI
+    static constexpr int kSentSettleS = 25;      // quiet seconds that end an event
+    static constexpr int kSentEventMaxS = 90;    // force-settle watchdog for a stuck event
+    static constexpr int kSentBackStreak = 2;    // consecutive quiet cycles to confirm a state
+    static constexpr uint8_t kSentRoiVer = 2;    // bump to migrate stored ROI to new defaults
+
+    std::atomic<bool> sent_en_{false};
+    std::atomic<uint16_t> sent_interval_{15};    // seconds between samples
+    std::atomic<uint16_t> sent_away_{120};       // seconds without motion => away
+    std::atomic<uint16_t> sent_cup_absent_{30};  // minutes of absence => one reminder
+    std::atomic<bool> sent_probe_{false};        // one-shot cycle for calibration
+    uint16_t sent_roi_[4] = {150, 450, 750, 450}; // permille x,y,w,h (full desk band, v2)
+    uint32_t sent_drink_count_ = 0;              // persisted, silent counter
+
+    // Runtime state, touched only by the sentinel task
+    uint8_t* sent_gray_ = nullptr;       // kSentGW*kSentGH current map
+    uint8_t* sent_prev_ = nullptr;       // previous map for global motion
+    uint8_t* sent_roi_base_ = nullptr;   // ROI baseline (last stable scene)
+    uint8_t* sent_roi_empty_ = nullptr;  // ROI scene without the cup (absent ref)
+    bool sent_has_prev_ = false;
+    bool sent_has_base_ = false;
+    uint8_t sent_hot_[16 * 9] = {0};     // per-cell consecutive-activity counter (hot masking)
+
+    // PC bridge client (esp32-robot-brain), touched by the bridge task only
+    std::string bridge_url_;
+    std::string bridge_token_;
+    std::atomic<int> bridge_play_result_{0};  // 0=waiting 1=started 2=busy/failed
+    int sent_roi_mean_base_ = 0;         // mean gray of ROI at baseline
+    int sent_event_run_s_ = 0;           // seconds the current event has run
+    bool sent_absent_ = false;
+    bool sent_absent_reminded_ = false;
+    bool sent_event_ = false;            // ROI event in progress
+    int sent_event_quiet_s_ = 0;
+    int sent_gone_streak_ = 0;           // consecutive quiet cycles with huge ROI diff
+    int sent_baseline_quiet_s_ = 0;
+    int sent_still_s_ = 0;               // consecutive seconds without global motion
+    bool sent_away_latched_ = false;
+    int sent_absent_s_ = 0;
+    time_t sent_last_motion_ = 0;
+
+    void LoadSentinel() {
+        nvs_handle_t h;
+        if (nvs_open("claw_sentry", NVS_READONLY, &h) != ESP_OK) return;
+        uint8_t en = 0;
+        uint16_t iv = 0, away = 0, cupabs = 0;
+        uint32_t drink = 0;
+        uint16_t roi[4];
+        size_t len = sizeof(roi);
+        if (nvs_get_u8(h, "en", &en) == ESP_OK) sent_en_.store(en != 0);
+        if (nvs_get_u16(h, "iv", &iv) == ESP_OK && iv >= 5 && iv <= 300)
+            sent_interval_.store(iv);
+        if (nvs_get_u16(h, "away", &away) == ESP_OK && away >= 30)
+            sent_away_.store(away);
+        if (nvs_get_u16(h, "cupabs", &cupabs) == ESP_OK && cupabs >= 1)
+            sent_cup_absent_.store(cupabs);
+        if (nvs_get_u32(h, "drink", &drink) == ESP_OK) sent_drink_count_ = drink;
+        uint8_t roiv = 0;
+        nvs_get_u8(h, "roiv", &roiv);
+        bool roi_migrated = false;
+        if (roiv >= kSentRoiVer &&
+            nvs_get_blob(h, "roi", roi, &len) == ESP_OK && len == sizeof(roi)) {
+            for (int i = 0; i < 4; ++i) {
+                if (roi[i] <= 1000) sent_roi_[i] = roi[i];
+            }
+        } else if (roiv < kSentRoiVer) {
+            roi_migrated = true;  // ROI from an older layout: keep new defaults
+        }
+        nvs_close(h);
+        if (roi_migrated) SaveSentinel();  // persist new defaults + version
+        ESP_LOGI(TAG, "Desk sentinel: %s, every %us, roi=%u,%u,%u,%u, drinks=%lu",
+                 sent_en_.load() ? "enabled" : "disabled", sent_interval_.load(),
+                 sent_roi_[0], sent_roi_[1], sent_roi_[2], sent_roi_[3],
+                 (unsigned long)sent_drink_count_);
+    }
+
+    void SaveSentinel() {
+        nvs_handle_t h;
+        if (nvs_open("claw_sentry", NVS_READWRITE, &h) != ESP_OK) return;
+        nvs_set_u8(h, "en", sent_en_.load() ? 1 : 0);
+        nvs_set_u16(h, "iv", sent_interval_.load());
+        nvs_set_u16(h, "away", sent_away_.load());
+        nvs_set_u16(h, "cupabs", sent_cup_absent_.load());
+        nvs_set_u32(h, "drink", sent_drink_count_);
+        nvs_set_u8(h, "roiv", kSentRoiVer);
+        nvs_set_blob(h, "roi", sent_roi_, sizeof(sent_roi_));
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    void ResetSentinelScene() {
+        sent_has_prev_ = false;
+        sent_has_base_ = false;
+        sent_event_ = false;
+        sent_absent_ = false;
+        sent_absent_reminded_ = false;
+        sent_gone_streak_ = 0;
+        sent_baseline_quiet_s_ = 0;
+        sent_event_quiet_s_ = 0;
+        sent_still_s_ = 0;
+        sent_away_latched_ = false;
+    }
+
+    // Diff of the ROI rect between the baseline buffer and sent_gray_.
+    // Returns changed-cell count and the bbox of changed cells (gray px).
+    int SentinelRoiDiff(int rx, int ry, int rwp, int rhp, const uint8_t* base,
+                        int* min_x, int* min_y, int* max_x, int* max_y) {
+        int cells_x = rwp / kSentRoiCell;
+        int cells_y = rhp / kSentRoiCell;
+        int changed_cells = 0;
+        if (min_x) *min_x = -1;
+        if (min_y) *min_y = -1;
+        if (max_x) *max_x = -1;
+        if (max_y) *max_y = -1;
+        int cell_act_th = (kSentRoiCell * kSentRoiCell) / 4;
+        for (int cy = 0; cy < cells_y; ++cy) {
+            for (int cx = 0; cx < cells_x; ++cx) {
+                int act = 0;
+                for (int y = ry + cy * kSentRoiCell;
+                     y < ry + (cy + 1) * kSentRoiCell; ++y) {
+                    for (int x = rx + cx * kSentRoiCell;
+                         x < rx + (cx + 1) * kSentRoiCell; ++x) {
+                        int cur = y * kSentGW + x;
+                        int ref = (y - ry) * rwp + (x - rx);  // packed ROI stride
+                        if (abs((int)sent_gray_[cur] - (int)base[ref]) >= kSentPxTh) ++act;
+                    }
+                }
+                if (act >= cell_act_th) {
+                    ++changed_cells;
+                    if (min_x) {
+                        int x0 = rx + cx * kSentRoiCell, y0 = ry + cy * kSentRoiCell;
+                        if (*min_x < 0 || x0 < *min_x) *min_x = x0;
+                        if (*min_y < 0 || y0 < *min_y) *min_y = y0;
+                        if (x0 + kSentRoiCell > *max_x) *max_x = x0 + kSentRoiCell;
+                        if (y0 + kSentRoiCell > *max_y) *max_y = y0 + kSentRoiCell;
+                    }
+                }
+            }
+        }
+        return changed_cells;
+    }
+
+    void SentinelSnapshotRoi(int rx, int ry, int rwp, int rhp, uint8_t* dst) {
+        for (int y = 0; y < rhp; ++y) {
+            memcpy(dst + y * rwp, sent_gray_ + (ry + y) * kSentGW + rx, rwp);
+        }
+    }
+
+    // Mean gray of the current ROI rect (used to tell "cup moved within ROI"
+    // (mean ~unchanged) from "cup removed / left the ROI" (mean shifts)).
+    int SentinelRoiMean(int rx, int ry, int rwp, int rhp) {
+        long sum = 0;
+        for (int y = ry; y < ry + rhp; ++y) {
+            const uint8_t* row = sent_gray_ + y * kSentGW + rx;
+            for (int x = 0; x < rwp; ++x) sum += row[x];
+        }
+        return (int)(sum / (rwp * rhp));
+    }
+
+    void SentinelCycle(bool verbose) {
+        if (esp_video_ == nullptr) return;
+        if (GetDeviceStateSafe() != kDeviceStateIdle) {
+            // Camera may be claimed by an active conversation; scene reference
+            // is stale, so re-baseline on the next quiet moment. Rate-limit
+            // the log (once a minute) to avoid spamming long conversations.
+            static int busy_skip = 0;
+            if ((busy_skip++ % 4) == 0) {
+                ESP_LOGI(TAG, "Sentinel: device busy, skip (state=%d)",
+                         (int)GetDeviceStateSafe());
+            }
+            if (sent_has_prev_ || sent_has_base_) {
+                ESP_LOGI(TAG, "Sentinel: scene state reset");
+                ResetSentinelScene();
+            }
+            return;
+        }
+        int iv = sent_interval_.load();
+        if (iv < 5) iv = 5;
+
+        TickType_t t0 = xTaskGetTickCount();
+        esp_video_->SetPreviewEnabled(false);
+        bool ok = esp_video_->Capture();
+        std::vector<uint8_t> jpeg;
+        uint16_t jw = 0, jh = 0;
+        if (ok) ok = esp_video_->GetLastJpegFrame(jpeg, &jw, &jh);
+        esp_video_->SetPreviewEnabled(true);
+        if (!ok) {
+            ESP_LOGW(TAG, "Sentinel: capture failed");
+            return;
+        }
+
+        uint8_t* rgb = nullptr;
+        size_t rlen = 0, rw = 0, rh = 0, rstride = 0;
+        if (jpeg_to_image(jpeg.data(), jpeg.size(), &rgb, &rlen, &rw, &rh, &rstride) != ESP_OK ||
+            rgb == nullptr) {
+            ESP_LOGW(TAG, "Sentinel: jpeg decode failed");
+            return;
+        }
+        for (int y = 0; y < kSentGH; ++y) {
+            int sy = (int)((int64_t)y * (int)rh / kSentGH);
+            const uint8_t* row = rgb + (size_t)sy * rstride;
+            for (int x = 0; x < kSentGW; ++x) {
+                int sx = (int)((int64_t)x * (int)rw / kSentGW);
+                uint16_t v = row[sx * 2] | (row[sx * 2 + 1] << 8);
+                int r8 = (int)((v >> 11) & 0x1F) << 3;
+                int g8 = (int)((v >> 5) & 0x3F) << 2;
+                int b8 = (int)(v & 0x1F) << 3;
+                sent_gray_[y * kSentGW + x] =
+                    (uint8_t)((r8 * 77 + g8 * 151 + b8 * 28) >> 8);
+            }
+        }
+        heap_caps_free(rgb);
+        uint32_t cost_ms = (xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
+
+        // --- ROI rect in gray coordinates ---
+        int rx = (int)((int64_t)sent_roi_[0] * kSentGW / 1000);
+        int ry = (int)((int64_t)sent_roi_[1] * kSentGH / 1000);
+        int rwp = (int)((int64_t)sent_roi_[2] * kSentGW / 1000);
+        int rhp = (int)((int64_t)sent_roi_[3] * kSentGH / 1000);
+        if (rx < 0) rx = 0;
+        if (ry < 0) ry = 0;
+        if (rx + rwp > kSentGW) rwp = kSentGW - rx;
+        if (ry + rhp > kSentGH) rhp = kSentGH - ry;
+        if (rwp < 8 || rhp < 8) {
+            ESP_LOGW(TAG, "Sentinel: ROI too small, skipping cycle");
+            return;
+        }
+
+        // --- Global motion (with hot-cell self-masking) ---
+        // Cells active in kSentHotTh+ consecutive cycles are persistent noise
+        // sources (sensor hot pixels / PWM flicker): masked out until they go
+        // quiet again. Intermittent real motion never accumulates the streak.
+        int motion_cells = 0;
+        long sum_diff = 0;
+        int px10 = 0, px20 = 0, px40 = 0;
+        long sum_gray = 0;
+        int hot_cells = 0;
+        char act_list[48] = {0};  // counted cell coords for calibration logs
+        size_t act_len = 0;
+        if (sent_has_prev_) {
+            for (int cy = 0; cy < 9; ++cy) {
+                for (int cx = 0; cx < 16; ++cx) {
+                    int act = 0;
+                    for (int y = cy * 10; y < cy * 10 + 10; ++y) {
+                        for (int x = cx * 10; x < cx * 10 + 10; ++x) {
+                            int idx = y * kSentGW + x;
+                            int d = abs((int)sent_gray_[idx] - (int)sent_prev_[idx]);
+                            sum_diff += d;
+                            if (d >= 10) ++px10;
+                            if (d >= 20) ++px20;
+                            if (d >= 40) ++px40;
+                            if (d >= kSentPxTh) ++act;
+                        }
+                    }
+                    uint8_t& h = sent_hot_[cy * 16 + cx];
+                    if (act >= kSentCellActPx) {
+                        if (h < 250) ++h;
+                        if (h >= kSentHotTh) {
+                            ++hot_cells;  // masked, not counted as motion
+                        } else {
+                            ++motion_cells;
+                            if (act_len + 8 < sizeof(act_list)) {
+                                act_len += snprintf(act_list + act_len,
+                                                    sizeof(act_list) - act_len,
+                                                    "%d,%d;", cx, cy);
+                            }
+                        }
+                    } else if (h > 0) {
+                        --h;
+                    }
+                }
+            }
+        }
+        // ROI activity vs the PREVIOUS frame (computed before sent_prev_ is
+        // overwritten below). Used for event quiet detection: a settled scene
+        // that permanently differs from the baseline must not latch events.
+        int roi_activity = 0;
+        if (sent_has_prev_) {
+            roi_activity = SentinelRoiDiff(rx, ry, rwp, rhp, sent_prev_,
+                                           nullptr, nullptr, nullptr, nullptr);
+        }
+        for (int i = 0; i < kSentGW * kSentGH; ++i) sum_gray += sent_gray_[i];
+        memcpy(sent_prev_, sent_gray_, kSentGW * kSentGH);
+        sent_has_prev_ = true;
+
+        if (motion_cells > kSentQuietCells) {
+            int away_total = sent_still_s_;
+            sent_still_s_ = 0;
+            sent_last_motion_ = time(nullptr);
+            if (sent_away_latched_) {
+                sent_away_latched_ = false;
+                ESP_LOGI(TAG, "Sentinel EVENT: PERSON BACK after %ds away", away_total);
+                BridgeNotify("speak", "主人回到座位啦，刚才离开了大约 " +
+                             std::to_string((away_total + 59) / 60) + " 分钟。");
+            }
+            sent_gone_streak_ = 0;
+        } else {
+            sent_still_s_ += iv;
+            if (!sent_away_latched_ && sent_still_s_ >= (int)sent_away_.load()) {
+                sent_away_latched_ = true;
+                ESP_LOGI(TAG, "Sentinel EVENT: AWAY (no motion for %ds)", sent_still_s_);
+                BridgeNotify("alert", "主人离开了座位（已 " +
+                             std::to_string(sent_still_s_) + " 秒没有活动）");
+                // Phase 3: WakeWordInvoke cloud confirm goes here once
+                // thresholds are calibrated.
+            }
+        }
+        bool person_present = (time(nullptr) - sent_last_motion_) < 90;
+
+        // --- Cup ROI state machine ---
+        if (!sent_has_base_) {
+            if (motion_cells <= 2) {  // near-quiet; a couple of noise cells are ok
+                sent_baseline_quiet_s_ += iv;
+                if (sent_baseline_quiet_s_ >= kSentSettleS) {
+                    SentinelSnapshotRoi(rx, ry, rwp, rhp, sent_roi_base_);
+                    sent_roi_mean_base_ = SentinelRoiMean(rx, ry, rwp, rhp);
+                    sent_has_base_ = true;
+                    sent_gone_streak_ = 0;
+                    sent_event_ = false;
+                    ESP_LOGI(TAG, "Sentinel: cup baseline captured (%dx%d px)", rwp, rhp);
+                }
+            } else {
+                sent_baseline_quiet_s_ = 0;
+            }
+        } else if (sent_absent_) {
+            // Cup declared gone; watch for its return against the empty ref
+            int bminx, bminy, bmaxx, bmaxy;
+            int changed = SentinelRoiDiff(rx, ry, rwp, rhp, sent_roi_empty_,
+                                          &bminx, &bminy, &bmaxx, &bmaxy);
+            if (motion_cells == 0 && changed >= kSentRoiActCells) {
+                ++sent_gone_streak_;
+            } else if (motion_cells > kSentQuietCells) {
+                sent_gone_streak_ = 0;
+            }
+            if (sent_gone_streak_ >= kSentBackStreak) {
+                sent_gone_streak_ = 0;
+                sent_absent_ = false;
+                sent_absent_reminded_ = false;
+                sent_absent_s_ = 0;
+                SentinelSnapshotRoi(rx, ry, rwp, rhp, sent_roi_base_);
+                ESP_LOGI(TAG, "Sentinel EVENT: CUP BACK (absent %dmin)",
+                         sent_absent_s_ / 60);
+            } else {
+                sent_absent_s_ += iv;
+                int lim = (int)sent_cup_absent_.load() * 60;
+                if (!sent_absent_reminded_ && sent_absent_s_ >= lim &&
+                    GetDeviceStateSafe() == kDeviceStateIdle) {
+                    sent_absent_reminded_ = true;
+                    ESP_LOGI(TAG, "Sentinel EVENT: cup absent %dmin -> reminder",
+                             sent_absent_s_ / 60);
+                    GetDisplay()->ShowNotification("水杯去哪了？", 5000);
+                    Application::GetInstance().WakeWordInvoke("水杯去哪了");
+                }
+            }
+        } else if (sent_event_) {
+            // Event in progress; wait for the ROI to go quiet. Quietness is
+            // measured against the PREVIOUS frame (is anything still moving?),
+            // never against the baseline, else a scene that settled into a
+            // different look would latch the event forever.
+            int bminx, bminy, bmaxx, bmaxy;
+            int changed = SentinelRoiDiff(rx, ry, rwp, rhp, sent_roi_base_,
+                                          &bminx, &bminy, &bmaxx, &bmaxy);
+            if (roi_activity >= kSentRoiActCells) {
+                sent_event_quiet_s_ = 0;
+            } else {
+                sent_event_quiet_s_ += iv;
+            }
+            sent_event_run_s_ += iv;
+            bool force_settle = sent_event_run_s_ >= kSentEventMaxS;
+            if (sent_event_quiet_s_ >= kSentSettleS || force_settle) {
+                sent_event_ = false;
+                sent_event_run_s_ = 0;
+                int cells_total = (rwp / kSentRoiCell) * (rhp / kSentRoiCell);
+                int mean_now = SentinelRoiMean(rx, ry, rwp, rhp);
+                int dmean = mean_now - sent_roi_mean_base_;
+                ESP_LOGI(TAG,
+                         "Sentinel EVENT: CUP_SETTLED%s cells=%d/%d bbox=[%d,%d..%d,%d] dmean=%d present=%d",
+                         force_settle ? "(timeout)" : "",
+                         changed, cells_total, bminx, bminy, bmaxx, bmaxy,
+                         dmean, (int)person_present);
+                if (changed >= kSentRoiGoneCells && abs(dmean) >= kSentMeanShift) {
+                    // Cup left the ROI (mean shifted toward the desk-only look)
+                    sent_absent_ = true;
+                    sent_absent_s_ = 0;
+                    sent_absent_reminded_ = false;
+                    SentinelSnapshotRoi(rx, ry, rwp, rhp, sent_roi_empty_);
+                    ESP_LOGI(TAG, "Sentinel: cup ABSENT (empty reference captured)");
+                } else if (changed > 0 && person_present) {
+                    // Picked up and put back (same or new spot) while present:
+                    // silent drink event (user policy: count, never speak)
+                    ++sent_drink_count_;
+                    SaveSentinel();
+                    ESP_LOGI(TAG, "Sentinel: drink event #%lu (silent)",
+                             (unsigned long)sent_drink_count_);
+                } else if (changed > 0 && !person_present) {
+                    ESP_LOGW(TAG, "Sentinel: ROI changed while user away (tamper candidate)");
+                    BridgeNotify("alert", "离座期间桌面前哨发现监测区有变化，已拍照存档。");
+                    BridgeUploadPhoto("seat");  // archive evidence to the dashboard
+                } else {
+                    ESP_LOGI(TAG, "Sentinel: scene returned to baseline (no event)");
+                }
+                SentinelSnapshotRoi(rx, ry, rwp, rhp, sent_roi_base_);
+                sent_roi_mean_base_ = SentinelRoiMean(rx, ry, rwp, rhp);
+            }
+        } else {
+            // Quiet: classify deviations from the baseline
+            int bminx, bminy, bmaxx, bmaxy;
+            int changed = SentinelRoiDiff(rx, ry, rwp, rhp, sent_roi_base_,
+                                          &bminx, &bminy, &bmaxx, &bmaxy);
+            if (motion_cells <= kSentQuietCells && changed >= kSentRoiGoneCells) {
+                ++sent_gone_streak_;
+            } else {
+                if (changed < kSentRoiGoneCells) sent_gone_streak_ = 0;
+            }
+            if (sent_gone_streak_ >= kSentBackStreak) {
+                // Persistent huge diff while globally quiet: cup removed from
+                // the ROI (mean shift) or relocated far inside it (mean same).
+                sent_gone_streak_ = 0;
+                int mean_now = SentinelRoiMean(rx, ry, rwp, rhp);
+                int dmean = mean_now - sent_roi_mean_base_;
+                if (abs(dmean) >= kSentMeanShift) {
+                    sent_absent_ = true;
+                    sent_absent_s_ = 0;
+                    sent_absent_reminded_ = false;
+                    SentinelSnapshotRoi(rx, ry, rwp, rhp, sent_roi_empty_);
+                    SentinelSnapshotRoi(rx, ry, rwp, rhp, sent_roi_base_);
+                    sent_roi_mean_base_ = mean_now;
+                    ESP_LOGI(TAG, "Sentinel EVENT: CUP ABSENT (removed while quiet, dmean=%d)",
+                             dmean);
+                } else {
+                    // Cup relocated inside the ROI while quiet: big move
+                    if (person_present) {
+                        ++sent_drink_count_;
+                        SaveSentinel();
+                        ESP_LOGI(TAG, "Sentinel: drink event #%lu (silent, far move)",
+                                 (unsigned long)sent_drink_count_);
+                    } else {
+                        ESP_LOGW(TAG, "Sentinel: cup moved while user away (tamper candidate)");
+                    }
+                    SentinelSnapshotRoi(rx, ry, rwp, rhp, sent_roi_base_);
+                    sent_roi_mean_base_ = mean_now;
+                }
+            } else if (changed >= kSentRoiActCells) {
+                sent_event_ = true;
+                sent_event_quiet_s_ = 0;
+                sent_event_run_s_ = 0;
+                ESP_LOGI(TAG, "Sentinel: ROI event started (cells=%d)", changed);
+            }
+        }
+
+        // Per-cycle heartbeat (also serves threshold calibration)
+        int hb_roi = -1;
+        if (sent_has_base_ && !sent_absent_) {
+            hb_roi = SentinelRoiDiff(rx, ry, rwp, rhp, sent_roi_base_,
+                                     nullptr, nullptr, nullptr, nullptr);
+        }
+        ESP_LOGI(TAG,
+                 "Sentinel cyc: cost=%lums motion=%d hot=%d act=[%s] davg=%ld px10=%d px20=%d px40=%d "
+                 "gray=%ld roim=%d roi=%d still=%ds base=%d evt=%d absent=%d(%ds) drink=%lu",
+                 (unsigned long)cost_ms, motion_cells, hot_cells, act_list,
+                 sent_has_prev_ ? sum_diff / (kSentGW * kSentGH) : -1,
+                 px10, px20, px40, sum_gray / (kSentGW * kSentGH),
+                 sent_has_base_ ? SentinelRoiMean(rx, ry, rwp, rhp) : -1,
+                 hb_roi, sent_still_s_,
+                 (int)sent_has_base_, (int)sent_event_,
+                 (int)sent_absent_, sent_absent_ ? sent_absent_s_ : 0,
+                 (unsigned long)sent_drink_count_);
+    }
+
+    static void SentinelTask(void* arg) {
+        auto* self = static_cast<EspClawBoard*>(arg);
+        int disabled_skip = 0;
+        while (true) {
+            int iv = self->sent_interval_.load();
+            if (iv < 5) iv = 5;
+            vTaskDelay(pdMS_TO_TICKS(iv * 1000));
+            bool probe = self->sent_probe_.exchange(false);
+            if (!self->sent_en_.load() && !probe) {
+                if ((disabled_skip++ % 4) == 0) {
+                    ESP_LOGI(TAG, "Sentinel: disabled (enable via desk_watch)");
+                }
+                continue;
+            }
+            self->SentinelCycle(probe);
+        }
+    }
+
+    void InitializeSentinel() {
+        LoadSentinel();
+        sent_gray_ = (uint8_t*)heap_caps_malloc(kSentGW * kSentGH,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        sent_prev_ = (uint8_t*)heap_caps_malloc(kSentGW * kSentGH,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        sent_roi_base_ = (uint8_t*)heap_caps_malloc(kSentGW * kSentGH,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        sent_roi_empty_ = (uint8_t*)heap_caps_malloc(kSentGW * kSentGH,
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!sent_gray_ || !sent_prev_ || !sent_roi_base_ || !sent_roi_empty_) {
+            ESP_LOGE(TAG, "Sentinel: buffer alloc failed, engine disabled");
+            return;
+        }
+        xTaskCreate(SentinelTask, "claw_sentry", 8192, this, 1, nullptr);
+        ESP_LOGI(TAG, "Desk sentinel engine started");
+    }
+
+    std::string SentinelStatusString() {
+        char buf[224];
+        snprintf(buf, sizeof(buf),
+                 "{\"enabled\":%s,\"interval_s\":%u,\"drink_count\":%lu,"
+                 "\"still_s\":%d,\"away\":%s,\"cup_absent\":%s,\"absent_s\":%d,"
+                 "\"roi\":\"%u,%u,%u,%u\"}",
+                 sent_en_.load() ? "true" : "false", sent_interval_.load(),
+                 (unsigned long)sent_drink_count_, sent_still_s_,
+                 sent_away_latched_ ? "true" : "false",
+                 sent_absent_ ? "true" : "false",
+                 sent_absent_ ? sent_absent_s_ : 0,
+                 sent_roi_[0], sent_roi_[1], sent_roi_[2], sent_roi_[3]);
+        return std::string(buf);
+    }
+
+    // ---------------- PC bridge client (esp32-robot-brain) ----------------
+    // Reuses the open-source bridge as the robot's cloud-of-LAN "brain":
+    //  - periodic seat photos -> POST /vision (OpenCV presence + posture)
+    //  - rule-engine reminders -> GET /pending, played via local TTS URL
+    //  - sentinel events -> POST /notify (dashboard + speech queue)
+
+    static std::string BridgeUrlEncode(const std::string& s) {
+        static const char* hex = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(s.size() * 3);
+        for (unsigned char c : s) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                c == '.' || c == '~') {
+                out += (char)c;
+            } else {
+                out += '%';
+                out += hex[c >> 4];
+                out += hex[c & 0xF];
+            }
+        }
+        return out;
+    }
+
+    bool BridgeEnabled() const { return !bridge_url_.empty(); }
+
+    // The ml307 HttpClient has a lifecycle race: when the peer closes the
+    // connection, the tcp receive task can be between "recv() returned" and
+    // "disconnect callback fired" while our Close() early-returns (connected_
+    // was already cleared by the passive path, skipping the wait-for-task).
+    // Destroying the client in that window is a use-after-free (mutex lock
+    // on freed memory, EXCVADDR 0x31). Give the async disconnect callback a
+    // moment to settle before the unique_ptr is released.
+    static void BridgeHttpSettle(std::unique_ptr<Http>& http) {
+        http->Close();  // idempotent: early-returns when already closed
+        vTaskDelay(pdMS_TO_TICKS(200));
+        http.reset();   // destroy AFTER the callback has had its chance
+    }
+
+    // GET a bridge endpoint; returns the body on HTTP 200, else "".
+    std::string BridgeHttpGet(const std::string& url) {
+        std::string body;
+        auto network = GetNetwork();
+        if (network == nullptr) return body;
+        auto http = network->CreateHttp(0);
+        if (http == nullptr) return body;
+        if (!bridge_token_.empty()) http->SetHeader("X-Device-Token", bridge_token_);
+        http->SetTimeout(5000);
+        if (auto opened = http->Open("GET", url); opened) {
+            int status = 0;
+            if (auto sc = http->GetStatusCode()) status = sc.value();
+            if (status == 200) body = http->ReadAll();
+        }
+        BridgeHttpSettle(http);
+        return body;
+    }
+
+    std::string BridgeHttpPostJson(const std::string& path, const std::string& body) {
+        std::string resp;
+        auto network = GetNetwork();
+        if (network == nullptr) return resp;
+        auto http = network->CreateHttp(0);
+        if (http == nullptr) return resp;
+        if (!bridge_token_.empty()) http->SetHeader("X-Device-Token", bridge_token_);
+        http->SetHeader("Content-Type", "application/json");
+        http->SetTimeout(5000);
+        http->SetContent(std::string(body));
+        if (auto opened = http->Open("POST", bridge_url_ + path); opened) {
+            int status = 0;
+            if (auto sc = http->GetStatusCode()) status = sc.value();
+            if (status >= 200 && status < 300) resp = http->ReadAll();
+        }
+        BridgeHttpSettle(http);
+        return resp;
+    }
+
+    void BridgeAckAll() { BridgeHttpPostJson("/ack", "{}"); }
+
+    // Capture one frame and upload it to /vision (multipart, chunked).
+    bool BridgeUploadPhoto(const char* photo_type) {
+        if (esp_video_ == nullptr) return false;
+        if (GetDeviceStateSafe() != kDeviceStateIdle) return false;
+
+        esp_video_->SetPreviewEnabled(false);
+        bool ok = esp_video_->Capture();
+        std::vector<uint8_t> jpeg;
+        uint16_t jw = 0, jh = 0;
+        if (ok) ok = esp_video_->GetLastJpegFrame(jpeg, &jw, &jh);
+        esp_video_->SetPreviewEnabled(true);
+        if (!ok || jpeg.empty()) {
+            ESP_LOGW(TAG, "Bridge: capture failed");
+            return false;
+        }
+
+        auto network = GetNetwork();
+        if (network == nullptr) return false;
+        auto http = network->CreateHttp(3);
+        if (http == nullptr) return false;
+        std::string boundary = "----ESP32_CLAW_BOUNDARY";
+        if (!bridge_token_.empty()) http->SetHeader("X-Device-Token", bridge_token_);
+        http->SetHeader("X-Photo-Type", photo_type);
+        http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+        http->SetHeader("Transfer-Encoding", "chunked");
+        http->SetTimeout(10000);
+        if (auto opened = http->Open("POST", bridge_url_ + "/vision"); !opened) {
+            ESP_LOGW(TAG, "Bridge: /vision connect failed");
+            BridgeHttpSettle(http);
+            return false;
+        }
+        std::string head;
+        head += "--" + boundary + "\r\n";
+        head += "Content-Disposition: form-data; name=\"question\"\r\n\r\n\r\n";
+        head += "--" + boundary + "\r\n";
+        head += "Content-Disposition: form-data; name=\"file\"; filename=\"camera.jpg\"\r\n";
+        head += "Content-Type: image/jpeg\r\n\r\n";
+        std::string tail = "\r\n--" + boundary + "--\r\n";
+        bool okw = true;
+        if (auto w = http->Write(head.c_str(), head.size()); !w) okw = false;
+        if (okw && !jpeg.empty()) {
+            if (auto w = http->Write((const char*)jpeg.data(), jpeg.size()); !w) okw = false;
+        }
+        if (okw) {
+            if (auto w = http->Write(tail.c_str(), tail.size()); !w) okw = false;
+        }
+        if (okw) {
+            // Terminating zero-size chunk ("0\r\n\r\n"); without it the
+            // server never sees the end of the chunked body.
+            if (auto w = http->Write("", 0); !w) okw = false;
+        }
+        int status = 0;
+        if (auto sc = http->GetStatusCode()) status = sc.value();
+        http->ReadAll();  // drain the short answer ("好的，我看一眼。")
+        BridgeHttpSettle(http);
+        ESP_LOGI(TAG, "Bridge: photo(%s) %uB -> status %d",
+                 photo_type, (unsigned)jpeg.size(), status);
+        return okw && status == 200;
+    }
+
+    // Push a sentinel event to the bridge (dashboard log + speech queue).
+    void BridgeNotify(const std::string& type, const std::string& message) {
+        if (!BridgeEnabled()) return;
+        cJSON* j = cJSON_CreateObject();
+        if (j == nullptr) return;
+        cJSON_AddStringToObject(j, "type", type.c_str());
+        cJSON_AddStringToObject(j, "message", message.c_str());
+        cJSON_AddStringToObject(j, "source", "sentinel");
+        char* s = cJSON_PrintUnformatted(j);
+        std::string body = (s != nullptr) ? s : "";
+        cJSON_free(s);
+        cJSON_Delete(j);
+        BridgeHttpPostJson("/notify", body);
+    }
+
+    // Drain one reminder item: speak items are played with the bridge's
+    // local TTS via the upstream notify engine; others are shown as alerts.
+    void BridgePollPending() {
+        std::string body = BridgeHttpGet(bridge_url_ + "/pending");
+        if (body.empty()) return;
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (root == nullptr) return;
+        const cJSON* items = cJSON_GetObjectItem(root, "items");
+        do {
+            if (!cJSON_IsArray(items) || cJSON_GetArraySize(items) == 0) break;
+            const cJSON* it = cJSON_GetArrayItem(items, 0);
+            const cJSON* jtype = cJSON_GetObjectItem(it, "type");
+            const cJSON* jmsg = cJSON_GetObjectItem(it, "message");
+            std::string type = (jtype && jtype->valuestring) ? jtype->valuestring : "";
+            std::string msg = (jmsg && jmsg->valuestring) ? jmsg->valuestring : "";
+            if (msg.empty()) {
+                BridgeAckAll();
+                break;
+            }
+            // 桥接派单的"立即拍照复核"（2026-10-10）：哨兵离开/回归事件后
+            // 桥接会塞一张拍照单过来，立即上传一帧给视觉对账，取代干等
+            // 下一个 5 分钟周期照。设备忙时不 ack，下一个 10s tick 重试。
+            if (type == "photo") {
+                if (GetDeviceStateSafe() == kDeviceStateIdle) {
+                    BridgeUploadPhoto("seat");
+                    BridgeAckAll();
+                    ESP_LOGI(TAG, "Bridge: on-demand verify photo uploaded");
+                } else {
+                    ESP_LOGI(TAG, "Bridge: busy, verify photo retry later");
+                }
+                break;
+            }
+            if (type == "speak" || type == "remind_standup") {
+                std::string tts_resp = BridgeHttpGet(
+                    bridge_url_ + "/tts/url?text=" + BridgeUrlEncode(msg));
+                std::string audio_url;
+                cJSON* tj = cJSON_Parse(tts_resp.c_str());
+                if (tj != nullptr) {
+                    const cJSON* jurl = cJSON_GetObjectItem(tj, "url");
+                    if (jurl != nullptr && jurl->valuestring != nullptr) {
+                        audio_url = jurl->valuestring;
+                    }
+                    cJSON_Delete(tj);
+                }
+                if (audio_url.empty()) {
+                    ESP_LOGW(TAG, "Bridge: TTS synth failed, drop message");
+                    BridgeAckAll();
+                    break;
+                }
+                bridge_play_result_.store(0);
+                Application::GetInstance().Schedule(
+                    [this, audio_url, msg]() {
+                        bool started = Application::GetInstance().PlayNotifyAudio(audio_url, msg);
+                        bridge_play_result_.store(started ? 1 : 2);
+                    });
+                for (int i = 0; i < 30 && bridge_play_result_.load() == 0; ++i) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                int r = bridge_play_result_.load();
+                bridge_play_result_.store(0);
+                if (r == 1) {
+                    ESP_LOGI(TAG, "Bridge: speaking pending item (%s)", type.c_str());
+                    BridgeAckAll();
+                } else {
+                    ESP_LOGI(TAG, "Bridge: device busy, retry later");
+                    // No ack: the item stays queued for the next poll.
+                }
+            } else {
+                // alert / unknown types: show on screen only
+                std::string text = msg;
+                Application::GetInstance().Schedule([text]() {
+                    Application::GetInstance().Alert("Bridge", text.c_str(), "neutral");
+                });
+                BridgeAckAll();
+            }
+        } while (false);
+        cJSON_Delete(root);
+    }
+
+    static void BridgeTask(void* arg) {
+        auto* self = static_cast<EspClawBoard*>(arg);
+        int ticks = 0;
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            if (!self->BridgeEnabled()) continue;
+            self->BridgePollPending();
+            if (++ticks >= 30) {  // every ~5 minutes
+                // Only clear the counter when we actually attempt the
+                // upload: a busy device (conversation / TTS) skips it and
+                // should retry on the next 10s tick instead of silently
+                // waiting another full 5 minutes.
+                if (self->GetDeviceStateSafe() == kDeviceStateIdle) {
+                    ticks = 0;
+                    self->BridgeUploadPhoto("seat");
+                }
+            }
+        }
+    }
+
+    void InitializeBridge() {
+        bridge_url_ = CONFIG_CLAW_BRIDGE_URL;
+        bridge_token_ = CONFIG_CLAW_BRIDGE_TOKEN;
+        while (!bridge_url_.empty() && bridge_url_.back() == '/') {
+            bridge_url_.pop_back();
+        }
+        if (!BridgeEnabled()) {
+            ESP_LOGI(TAG, "Bridge client disabled (CONFIG_CLAW_BRIDGE_URL empty)");
+            return;
+        }
+        xTaskCreate(BridgeTask, "claw_bridge", 8192, this, 1, nullptr);
+        ESP_LOGI(TAG, "Bridge client started: %s", bridge_url_.c_str());
+    }
+
     void RegisterMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
 
@@ -794,6 +1610,74 @@ private:
                 ESP_LOGI(TAG, "One-shot auto look requested");
                 return std::string("好的，马上看一眼并说说看到了什么");
             });
+
+        // --- Desk sentinel: local watch for left-seat + water cup ---
+        mcp_server.AddTool("self.camera.desk_watch",
+            "Enable or disable the on-device desk sentinel. It watches the "
+            "camera LOCALLY (frames never leave the device) to detect when "
+            "the user leaves the seat, silently count water-drink events, "
+            "and give ONE voice reminder if the cup has been gone for many "
+            "minutes. Only use this when the user explicitly asks to start "
+            "or stop the seat/cup watch. Args: enable; interval_seconds "
+            "(5-300, how often to sample, default 15); cup_roi optional "
+            "\"x,y,w,h\" in permille of the frame pointing at where the cup "
+            "usually sits (default \"430,460,300,400\").",
+            PropertyList({
+                Property("enable", kPropertyTypeBoolean),
+                Property("interval_seconds", kPropertyTypeInteger, 15, 5, 300),
+                Property("cup_roi", kPropertyTypeString, std::string("")).SetMaxLength(31),
+            }), [this](const PropertyList& properties) -> ReturnValue {
+                bool enable = properties["enable"].value<bool>();
+                int iv = properties["interval_seconds"].value<int>();
+                std::string roi = properties["cup_roi"].value<std::string>();
+                if (!roi.empty()) {
+                    int v[4] = {0, 0, 0, 0};
+                    if (sscanf(roi.c_str(), "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]) == 4 &&
+                        v[0] >= 0 && v[1] >= 0 && v[2] > 0 && v[3] > 0 &&
+                        v[0] + v[2] <= 1000 && v[1] + v[3] <= 1000) {
+                        for (int i = 0; i < 4; ++i) sent_roi_[i] = (uint16_t)v[i];
+                    } else {
+                        return std::string("ROI 格式无效，应为 \"x,y,w,h\" 千分比，例如 430,460,300,400");
+                    }
+                }
+                sent_interval_.store((uint16_t)iv);
+                sent_en_.store(enable);
+                if (enable) {
+                    ResetSentinelScene();  // fresh baseline with the new settings
+                }
+                SaveSentinel();
+                if (enable) {
+                    char buf[160];
+                    snprintf(buf, sizeof(buf),
+                             "已开启桌面前哨：每 %d 秒本地巡检一次，喝水静默计数，"
+                             "水杯消失超过 %u 分钟提醒一句，离座检测开启。",
+                             iv, (unsigned)sent_cup_absent_.load());
+                    ESP_LOGI(TAG, "%s", buf);
+                    return std::string(buf);
+                }
+                ESP_LOGI(TAG, "Desk sentinel disabled");
+                return std::string("已关闭桌面前哨巡检。请直接告诉用户已关闭，"
+                                   "不要拍照或继续观察。");
+            });
+
+        mcp_server.AddTool("self.camera.desk_status",
+            "Report the desk sentinel status as JSON: enabled, interval, "
+            "drink_count, still_s (seconds without motion), away flag, "
+            "cup_absent flag and absent seconds, cup ROI. Use when the user "
+            "asks about the seat watch, the cup watch, or their drink count.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                return SentinelStatusString();
+            });
+
+        mcp_server.AddTool("self.camera.desk_probe",
+            "Run ONE desk sentinel detection cycle right now and log the "
+            "motion/ROI scores to the device log (no voice output). Use ONLY "
+            "when the user explicitly asks to test or calibrate the sentinel.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                sent_probe_.store(true);
+                ESP_LOGI(TAG, "Sentinel probe requested");
+                return std::string("好的，下一秒会执行一次本地检测并在日志里输出分数，不会说话");
+            });
     }
 
     void InitializeButtons() {
@@ -817,6 +1701,8 @@ public:
         RegisterMcpTools();
         InitializeReminders();
         InitializeAutoLook();
+        InitializeSentinel();
+        InitializeBridge();
         GetBacklight()->RestoreBrightness();
     }
 

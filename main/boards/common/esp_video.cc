@@ -434,6 +434,8 @@ bool EspVideo::Capture() {
         encoder_thread_.join();
     }
 
+    std::lock_guard<std::mutex> lock(capture_mutex_);
+
     if (!streaming_on_ || video_fd_ < 0) {
         ESP_LOGE(TAG, "Capture failed: camera did not initialize (streaming_on_=%d, video_fd_=%d)",
                  streaming_on_, video_fd_);
@@ -793,7 +795,7 @@ bool EspVideo::Capture() {
 
     // 显示预览图片
     auto display = Board::GetInstance().GetDisplay();
-    if (display != nullptr) {
+    if (preview_enabled_.load() && display != nullptr) {
         if (!frame_.data) {
             ESP_LOGE(TAG, "frame.data is null");
             return false;
@@ -903,6 +905,17 @@ bool EspVideo::Capture() {
             std::make_unique<LvglAllocatedImage>(data, lvgl_image_size, w, h, stride, color_format);
         display->SetPreviewImage(std::move(image));
     }
+    return true;
+}
+
+bool EspVideo::GetLastJpegFrame(std::vector<uint8_t>& out, uint16_t* width, uint16_t* height) {
+    std::lock_guard<std::mutex> lock(capture_mutex_);
+    if (frame_.format != V4L2_PIX_FMT_JPEG || frame_.data == nullptr || frame_.len == 0) {
+        return false;
+    }
+    out.assign(frame_.data, frame_.data + frame_.len);
+    if (width) *width = frame_.width;
+    if (height) *height = frame_.height;
     return true;
 }
 

@@ -2,7 +2,9 @@
 #include "sdkconfig.h"
 
 #include <lvgl.h>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -42,6 +44,11 @@ private:
     std::string explain_url_;
     std::string explain_token_;
     std::thread encoder_thread_;
+    // Serializes Capture()/GetLastJpegFrame(): two concurrent captures would
+    // race on the single V4L2 DQBUF/QBUF pair, and frame_.data may be freed
+    // and reallocated inside Capture().
+    std::mutex capture_mutex_;
+    std::atomic<bool> preview_enabled_{true};
 
 public:
     EspVideo(const esp_video_init_config_t& config);
@@ -53,4 +60,12 @@ public:
     virtual bool SetHMirror(bool enabled) override;
     virtual bool SetVFlip(bool enabled) override;
     virtual std::expected<std::string, std::string> Explain(const std::string& question) override;
+
+    // Copy of the last captured frame. Only supported when the sensor frame
+    // is JPEG (CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT boards). The copy is
+    // taken under capture_mutex_, so it is safe against concurrent Capture().
+    bool GetLastJpegFrame(std::vector<uint8_t>& out, uint16_t* width, uint16_t* height);
+    // Suppress the LVGL preview path in Capture() (skips the full-frame
+    // decode + alloc); used by low-rate background watchers.
+    void SetPreviewEnabled(bool enabled) { preview_enabled_.store(enabled); }
 };
