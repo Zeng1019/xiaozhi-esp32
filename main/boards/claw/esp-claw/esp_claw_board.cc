@@ -13,6 +13,8 @@
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <esp_task_wdt.h>
+#include <esp_timer.h>
 #include <driver/spi_common.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
@@ -575,6 +577,11 @@ private:
     std::string bridge_url_;
     std::string bridge_token_;
     std::atomic<int> bridge_play_result_{0};  // 0=waiting 1=started 2=busy/failed
+    // 看门狗进度戳（ms since boot）：BridgeTask 每次循环/每个 HTTP 步骤后更新；
+    // 守护任务发现 >90s 未更新即判定挂死并重启自愈。TCP 组件（78__esp-ml307，
+    // hash 保护不可改）的 Send()/Connect() 无超时，对端停收时 send() 会永久
+    // 阻塞——2026-10-10 11:49 两次挂死均属此类，只能靠看门狗兜底恢复。
+    std::atomic<int64_t> bridge_progress_ms_{0};
     int sent_roi_mean_base_ = 0;         // mean gray of ROI at baseline
     int sent_event_run_s_ = 0;           // seconds the current event has run
     bool sent_absent_ = false;
@@ -1299,13 +1306,30 @@ private:
         cJSON_Delete(root);
     }
 
+    void BridgeTouch() {
+        bridge_progress_ms_.store(esp_timer_get_time() / 1000);
+    }
+
     static void BridgeTask(void* arg) {
         auto* self = static_cast<EspClawBoard*>(arg);
         int ticks = 0;
+        // 订阅任务看门狗：本任务每 ≤1s 喂一次（远快于 TWDT 10s 超时）。
+        // 一旦卡死在无超时的 send()/connect() 里，TWDT 会在串口打印
+        // 该任务的调用栈（仅告警不 panic），同时守护任务 90s 后重启自愈。
+        esp_task_wdt_add(nullptr);
+        self->BridgeTouch();
         while (true) {
-            vTaskDelay(pdMS_TO_TICKS(10000));
-            if (!self->BridgeEnabled()) continue;
+            for (int i = 0; i < 10; ++i) {  // 10s tick，期间每秒喂 TWDT
+                esp_task_wdt_reset();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            if (!self->BridgeEnabled()) {
+                self->BridgeTouch();
+                continue;
+            }
+            self->BridgeTouch();
             self->BridgePollPending();
+            self->BridgeTouch();
             if (++ticks >= 30) {  // every ~5 minutes
                 // Only clear the counter when we actually attempt the
                 // upload: a busy device (conversation / TTS) skips it and
@@ -1314,7 +1338,27 @@ private:
                 if (self->GetDeviceStateSafe() == kDeviceStateIdle) {
                     ticks = 0;
                     self->BridgeUploadPhoto("seat");
+                    self->BridgeTouch();
                 }
+            }
+        }
+    }
+
+    // 守护任务：BridgeTask 卡死（TWDT 会先打印调用栈）超过 90s 无法自愈时
+    // 重启设备。请求失败（如桥接关机、连接被拒）不算挂死——那会立即返回
+    // 并照常更新进度戳；只有真正阻塞在 send()/connect()/相机里的死等才触发。
+    static void BridgeWatchdogTask(void* arg) {
+        auto* self = static_cast<EspClawBoard*>(arg);
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            int64_t last = self->bridge_progress_ms_.load();
+            if (last == 0) continue;
+            int64_t now = esp_timer_get_time() / 1000;
+            if (now - last > 90000) {
+                ESP_LOGE(TAG, "Bridge task stuck for %.0fs, rebooting to recover",
+                         (now - last) / 1000.0);
+                vTaskDelay(pdMS_TO_TICKS(500));  // let the log flush
+                esp_restart();
             }
         }
     }
@@ -1330,6 +1374,7 @@ private:
             return;
         }
         xTaskCreate(BridgeTask, "claw_bridge", 8192, this, 1, nullptr);
+        xTaskCreate(BridgeWatchdogTask, "claw_bridge_wdt", 3072, this, 1, nullptr);
         ESP_LOGI(TAG, "Bridge client started: %s", bridge_url_.c_str());
     }
 
