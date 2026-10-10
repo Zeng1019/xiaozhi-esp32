@@ -48,4 +48,9 @@
 #define CLAW_LED_STRIP_NUM    16
 #define CLAW_SERVO_GPIO       GPIO_NUM_47
 
+// Servo type: 1 = positional servo (SG90, 0-180 degrees, pulse = position,
+// holds wherever it is told to go); 0 = 360-degree continuous-rotation servo
+// (pulse = speed/direction, 1500 us = stop). Set to 0 if you swap back.
+#define CLAW_SERVO_POSITIONAL 1
+
 #endif // _BOARD_CONFIG_H_

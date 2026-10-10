@@ -3,9 +3,10 @@ menu "Xiaozhi Assistant"
 # esp_h264（registry 清单）的依赖规则引用了本符号，但 esp_h264 对 esp32s3
 # 因 target 规则被跳过、从不下载，符号无处定义 → 组件管理器
 # prepare_dependencies 以"Kconfig 变量未找到"硬失败（2026-10-10）。
-# 这里补一个默认 n 的空定义，语义与现状一致（不启用定制 h264）。
+# 注意：必须带 prompt（bool 后跟字符串），否则是不可见符号、不会写入
+# sdkconfig，reconfigure 重新生成 sdkconfig.json 时键会丢失、错误复发。
 config ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION
-    bool
+    bool "Use customized esp_h264 version"
     default n
 
 config OTA_URL

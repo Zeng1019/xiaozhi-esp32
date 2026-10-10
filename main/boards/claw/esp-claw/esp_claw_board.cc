@@ -123,7 +123,11 @@ private:
     esp_lcd_panel_handle_t panel_ = nullptr;
     led_strip_handle_t led_strip_ = nullptr;
     int led_brightness_ = 128;  // 0-255 master scale for the LED ring
+#if CLAW_SERVO_POSITIONAL
+    int servo_angle_ = 90;  // 0-180 degrees, SG90 positional servo holds here
+#else
     int servo_speed_ = 0;  // -100..100 percent, 0 = stopped
+#endif
 
     void InitializeUsb() {
         // Audio-first bring-up: install the USB host library ourselves and let
@@ -277,6 +281,49 @@ private:
         ESP_LOGI(TAG, "LED ring ready: %d leds on GPIO%d", CLAW_LED_STRIP_NUM, CLAW_LED_STRIP_GPIO);
     }
 
+#if CLAW_SERVO_POSITIONAL
+    // Positional servo (e.g. SG90): pulse width = absolute position.
+    // 500 us = 0 deg, 1500 us = 90 deg, 2500 us = 180 deg.
+    // 14-bit duty at 50 Hz: 20000 us = 16384 counts, so 1 us = 0.8192 counts.
+    static uint32_t ServoDuty(int angle) {
+        if (angle < 0) angle = 0;
+        if (angle > 180) angle = 180;
+        return 410 + angle * 1638 / 180;  // 90 deg -> 1229 counts = 1500 us
+    }
+
+    void InitializeServo() {
+        ledc_timer_config_t timer = {
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .duty_resolution = LEDC_TIMER_14_BIT,
+            .timer_num = LEDC_TIMER_1,  // TIMER_0/CHANNEL_0 are used by the LCD backlight
+            .freq_hz = 50,
+            .clk_cfg = LEDC_AUTO_CLK,
+            .deconfigure = false,
+        };
+        if (ledc_timer_config(&timer) != ESP_OK ||
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, ServoDuty(servo_angle_)) != ESP_OK ||
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1) != ESP_OK) {
+            ESP_LOGE(TAG, "Servo LEDC init failed");
+            return;
+        }
+        ledc_channel_config_t channel = {
+            .gpio_num = CLAW_SERVO_GPIO,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = LEDC_CHANNEL_1,
+            .timer_sel = LEDC_TIMER_1,
+            .duty = ServoDuty(servo_angle_),
+            .hpoint = 0,
+            .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
+            .flags = { .output_invert = 0 },
+            .deconfigure = false,
+        };
+        if (ledc_channel_config(&channel) != ESP_OK) {
+            ESP_LOGE(TAG, "Servo channel config failed on GPIO%d", CLAW_SERVO_GPIO);
+            return;
+        }
+        ESP_LOGI(TAG, "Positional servo (SG90) ready on GPIO%d, holding 90 deg", CLAW_SERVO_GPIO);
+    }
+#else
     // The attached servo is a 360-degree CONTINUOUS-ROTATION type (confirmed
     // on the bench: any pulse other than the neutral one spins the output
     // shaft non-stop). Pulse width therefore sets SPEED and DIRECTION, not
@@ -320,20 +367,22 @@ private:
         }
         ESP_LOGI(TAG, "Continuous-rotation servo ready on GPIO%d (neutral = stopped)", CLAW_SERVO_GPIO);
     }
+#endif
 
     // ---- Persistent reminders (NVS) that make the device speak when due ----
     // Daily reminders fire once per calendar day at HH:MM; interval reminders
-    // re-fire every N minutes. On fire the device opens an audio session and
+    // re-fire every N minutes; one-shot reminders fire once at an absolute
+    // time and are then removed. On fire the device opens an audio session and
     // sends the message text as if spoken, so the cloud AI answers by voice.
     static constexpr int kMaxReminders = 4;
     struct ClawReminder {
-        uint8_t type;            // 0 = daily HH:MM, 1 = every interval_min
+        uint8_t type;            // 0 = daily HH:MM, 1 = every interval_min, 2 = one-shot at next_due
         uint8_t hour;            // daily: 0-23
         uint8_t minute;          // daily: 0-59
         uint16_t interval_min;   // interval type: period in minutes
         char message[64];        // what the reminder is about (UTF-8)
         uint16_t last_fired_yday;// daily dedup: day-of-year already fired
-        time_t next_due;         // interval type: earliest fire time
+        time_t next_due;         // interval: earliest fire time; one-shot: absolute fire time
     };
     std::vector<ClawReminder> reminders_;
     SemaphoreHandle_t reminders_mutex_ = nullptr;
@@ -414,11 +463,15 @@ private:
                 self->test_fire_.exchange(false)) {
                 auto& tr = self->reminders_.front();
                 if (tr.type == 0) tr.last_fired_yday = lt.tm_yday;
-                else tr.next_due = now + (time_t)tr.interval_min * 60;
+                else if (tr.type == 1) tr.next_due = now + (time_t)tr.interval_min * 60;
+                // type 2 (one-shot): leave next_due untouched — the scheduler
+                // fires it when due (immediately, if already past due).
                 dirty = true;
                 self->FireReminder(tr);
             }
-            for (auto& r : self->reminders_) {
+            std::vector<int> to_erase;  // fired one-shots, erased after the loop
+            for (int i = 0; i < (int)self->reminders_.size(); ++i) {
+                auto& r = self->reminders_[i];
                 if (r.type == 0) {
                     // Daily at HH:MM, once per calendar day
                     if (lt.tm_hour == r.hour && lt.tm_min == r.minute &&
@@ -427,7 +480,7 @@ private:
                         r.last_fired_yday = lt.tm_yday;
                         self->FireReminder(r);
                     }
-                } else {
+                } else if (r.type == 1) {
                     // Every N minutes; skip while busy, catch up once free
                     if (now >= r.next_due &&
                         self->GetDeviceStateSafe() == kDeviceStateIdle) {
@@ -435,7 +488,21 @@ private:
                         dirty = true;  // persist the advanced next_due
                         self->FireReminder(r);
                     }
+                } else if (r.type == 2) {
+                    // One-shot at absolute time; removed after firing.
+                    // If the moment passes while busy, fire as soon as idle.
+                    if (now >= r.next_due &&
+                        self->GetDeviceStateSafe() == kDeviceStateIdle) {
+                        to_erase.push_back(i);
+                        dirty = true;
+                        self->FireReminder(r);
+                    }
                 }
+            }
+            for (int k = (int)to_erase.size() - 1; k >= 0; --k) {
+                ESP_LOGI(TAG, "One-shot reminder fired and removed: %s",
+                         self->reminders_[to_erase[k]].message);
+                self->reminders_.erase(self->reminders_.begin() + to_erase[k]);
             }
             xSemaphoreGive(self->reminders_mutex_);
             if (dirty) self->SaveReminders();
@@ -1436,6 +1503,34 @@ private:
                 return true;
             });
 
+#if CLAW_SERVO_POSITIONAL
+        // --- Servo (positional SG90 on GPIO47) ---
+        // Pulse width = absolute position. The horn STAYS at the commanded
+        // angle (PWM keeps flowing) — no auto-return, no timed spin.
+        mcp_server.AddTool("self.servo.set_angle",
+            "Set the servo horn to an absolute angle. angle: 0-180 degrees "
+            "(90 = center). The servo moves there and HOLDS the position — "
+            "it does not drift back. Use for pointing, waving, pushing etc.",
+            PropertyList({
+                Property("angle", kPropertyTypeInteger, 0, 180),
+            }), [this](const PropertyList& properties) -> ReturnValue {
+                servo_angle_ = properties["angle"].value<int>();
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, ServoDuty(servo_angle_));
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+                ESP_LOGI(TAG, "Servo angle %d deg", servo_angle_);
+                return true;
+            });
+
+        mcp_server.AddTool("self.servo.stop",
+            "Return the servo horn to center position (90 degrees).",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                servo_angle_ = 90;
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, ServoDuty(90));
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+                ESP_LOGI(TAG, "Servo centered (90 deg)");
+                return true;
+            });
+#else
         // --- Servo (continuous-rotation type on GPIO47) ---
         // Pulse width = speed/direction, NOT position: 0% = stop, +/- = spin.
         mcp_server.AddTool("self.servo.set_speed",
@@ -1480,6 +1575,7 @@ private:
                 ESP_LOGI(TAG, "Servo stopped");
                 return true;
             });
+#endif
 
         // --- Persistent reminders (survive reboot, stored in NVS) ---
         mcp_server.AddTool("self.reminder.add_daily",
@@ -1546,6 +1642,60 @@ private:
                 return std::string(buf);
             });
 
+        mcp_server.AddTool("self.reminder.add_once",
+            "Create a ONE-TIME reminder: fires ONCE at the given time, then "
+            "deletes itself automatically. hour/minute: time of day; "
+            "day_offset: 0 = today, 1 = tomorrow, 2 = day after tomorrow... "
+            "If that time has already passed, it fires on the next day "
+            "instead. Use this for one-off asks like '20:30 提醒我拿快递'. "
+            "Max 4 reminders total.",
+            PropertyList({
+                Property("hour", kPropertyTypeInteger, 0, 23),
+                Property("minute", kPropertyTypeInteger, 0, 59),
+                Property("day_offset", kPropertyTypeInteger, 0, 30),
+                Property("message", kPropertyTypeString).SetMaxLength(63),
+            }), [this](const PropertyList& properties) -> ReturnValue {
+                xSemaphoreTake(reminders_mutex_, portMAX_DELAY);
+                if (reminders_.size() >= kMaxReminders) {
+                    xSemaphoreGive(reminders_mutex_);
+                    return std::string("失败：提醒数量已达上限(4个)，请先删除一些");
+                }
+                time_t now = time(nullptr);
+                struct tm t;
+                localtime_r(&now, &t);
+                t.tm_hour = properties["hour"].value<int>();
+                t.tm_min = properties["minute"].value<int>();
+                t.tm_sec = 0;
+                t.tm_mday += properties["day_offset"].value<int>();
+                time_t due = mktime(&t);
+                int bumped = 0;
+                while (due <= now) {  // time already passed -> next day
+                    t.tm_mday += 1;
+                    due = mktime(&t);
+                    ++bumped;
+                }
+                ClawReminder r = {};
+                r.type = 2;
+                r.last_fired_yday = kYdayNever;
+                r.next_due = due;
+                strncpy(r.message, properties["message"].value<std::string>().c_str(),
+                        sizeof(r.message) - 1);
+                reminders_.push_back(r);
+                SaveReminders();
+                int index = (int)reminders_.size() - 1;
+                xSemaphoreGive(reminders_mutex_);
+                struct tm dt;
+                localtime_r(&due, &dt);
+                char buf[320];
+                snprintf(buf, sizeof(buf),
+                         "已设置单次提醒(编号%d)：%s，将在 %d月%d日 %02d:%02d 播报一次%s",
+                         index, r.message, dt.tm_mon + 1, dt.tm_mday,
+                         dt.tm_hour, dt.tm_min,
+                         bumped > 0 ? "（该时刻已过，自动顺延到明天）" : "");
+                ESP_LOGI(TAG, "%s", buf);
+                return std::string(buf);
+            });
+
         mcp_server.AddTool("self.reminder.list",
             "List all active reminders with their index numbers.",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
@@ -1561,9 +1711,16 @@ private:
                             snprintf(buf, sizeof(buf), "\n%d. 每天 %02d:%02d：%s",
                                      i, reminders_[i].hour, reminders_[i].minute,
                                      reminders_[i].message);
-                        } else {
+                        } else if (reminders_[i].type == 1) {
                             snprintf(buf, sizeof(buf), "\n%d. 每 %d 分钟：%s",
                                      i, reminders_[i].interval_min, reminders_[i].message);
+                        } else {
+                            struct tm dt;
+                            localtime_r(&reminders_[i].next_due, &dt);
+                            snprintf(buf, sizeof(buf),
+                                     "\n%d. 单次 %d月%d日 %02d:%02d：%s",
+                                     i, dt.tm_mon + 1, dt.tm_mday,
+                                     dt.tm_hour, dt.tm_min, reminders_[i].message);
                         }
                         out += buf;
                     }

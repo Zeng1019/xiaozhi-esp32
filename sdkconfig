@@ -962,6 +962,8 @@ CONFIG_PARTITION_TABLE_MD5=y
 # Xiaozhi Assistant
 #
 # default:
+# CONFIG_ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION is not set
+# default:
 CONFIG_OTA_URL="https://api.tenclass.net/xiaozhi/ota/"
 CONFIG_CLAW_BRIDGE_URL="http://192.168.31.234:8787"
 CONFIG_CLAW_BRIDGE_TOKEN="9a3cbf27df6abc3b4c8a55c5bbf8a8d3"
