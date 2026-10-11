@@ -82,6 +82,14 @@ public:
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;
+
+    // 语音任务路由钩子（2026-10-11）：stt 文本回传时调用。返回 true 表示
+    // 该句话已被路由走（如转交外部 Agent），Application 会据此打断云端
+    // LLM 的抢答；返回 false 表示放行，小智云端照常回答。默认不拦截。
+    virtual bool OnUserUtteranceRoute(const std::string& text) {
+        (void)text;
+        return false;
+    }
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \

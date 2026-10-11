@@ -1894,6 +1894,55 @@ private:
     }
 
 public:
+    // ---------------- 语音任务路由（2026-10-11） ----------------
+    // 规则分类器：命中"复杂任务"关键词 → 转交桥接 /agent_task（WorkBuddy
+    // 无头执行），否则放行给小智云端（fail-open：不确定=简单）。整个分类
+    // 只是常量字符串子串匹配，几 KB Flash、零堆分配压力，板上跑毫无负担。
+    static bool IsComplexTask(const std::string& text) {
+        // ASCII 关键词统一小写比较；中文关键词 UTF-8 字节精确匹配
+        static const char* const kTriggers[] = {
+            "workbuddy", "沃克巴迪",
+            "整理", "归纳", "总结", "分析", "调研",
+            "报告", "周报", "日报",
+            "写一份", "写一篇", "写个", "帮我写", "写一段", "生成一份", "做一份", "做一版",
+            "搜索", "搜一下", "查资料", "上网查",
+            "代码", "编程", "脚本",
+            "文档", "方案", "翻译",
+        };
+        std::string lower;
+        lower.reserve(text.size());
+        for (char c : text) lower += static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        for (const char* kw : kTriggers) {
+            std::string kl;
+            for (const char* p = kw; *p; ++p) kl += static_cast<char>(tolower(static_cast<unsigned char>(*p)));
+            if (lower.find(kl) != std::string::npos) return true;
+        }
+        return false;
+    }
+
+    // Board 钩子实现：返回 true = 已派单成功，Application 会打断云端抢答；
+    // 桥接不可达（电脑关机）/busy/拒单 → 返回 false，小智照常回答。
+    bool OnUserUtteranceRoute(const std::string& text) override {
+        if (!IsComplexTask(text)) return false;
+        if (!BridgeEnabled()) {
+            ESP_LOGI(TAG, "Router: complex task but bridge disabled, let cloud answer");
+            return false;
+        }
+        ESP_LOGI(TAG, "Router: complex task (%d bytes), forwarding to bridge", (int)text.size());
+        cJSON* j = cJSON_CreateObject();
+        if (j == nullptr) return false;
+        cJSON_AddStringToObject(j, "text", text.c_str());
+        char* s = cJSON_PrintUnformatted(j);
+        std::string body = (s != nullptr) ? s : "";
+        cJSON_free(s);
+        cJSON_Delete(j);
+        std::string resp = BridgeHttpPostJson("/agent_task", body);
+        bool accepted = resp.find("accepted") != std::string::npos;
+        ESP_LOGI(TAG, "Router: bridge %s", accepted ? "accepted the task"
+                 : (resp.empty() ? "unreachable, let cloud answer" : resp.substr(0, 60).c_str()));
+        return accepted;
+    }
+
     EspClawBoard() : boot_button_(BOOT_BUTTON_GPIO) {
         InitializeUsb();
         InitializeLcdDisplay();

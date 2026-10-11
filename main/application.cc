@@ -666,6 +666,12 @@ void Application::InitializeProtocol() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
                 });
+                // 语音任务路由（2026-10-11）：板级规则判定复杂任务并成功
+                // 派单给桥接（WorkBuddy）时，打断云端 LLM 的抢答；桥接
+                // 不可达/拒单时返回 false，小智照常回答（fail-open）。
+                if (Board::GetInstance().OnUserUtteranceRoute(text->valuestring)) {
+                    Schedule([this]() { AbortSpeaking(kAbortReasonNone); });
+                }
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
