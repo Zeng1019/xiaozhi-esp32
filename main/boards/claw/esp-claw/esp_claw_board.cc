@@ -644,6 +644,12 @@ private:
     std::string bridge_url_;
     std::string bridge_token_;
     std::atomic<int> bridge_play_result_{0};  // 0=waiting 1=started 2=busy/failed
+    // 语音任务派单成功后收线计数（秒）：设备此刻多半还在聆听会话里，而
+    // PlayNotifyAudio 只在 idle 才能播——不收线的话桥接回执要等会话超时
+    // 退出才突然冒出来（2026-10-11 16:57 实测"卡很久→退出→才播回执"）。
+    // BridgeTask 每 1s 递减：见 Listening 立即 StopListening 收线回 idle；
+    // 已是 idle 或倒数到 0（异常兜底）就放弃。
+    std::atomic<int> bridge_close_session_{0};
     // 看门狗进度戳（ms since boot）：BridgeTask 每次循环/每个 HTTP 步骤后更新；
     // 守护任务发现 >90s 未更新即判定挂死并重启自愈。TCP 组件（78__esp-ml307，
     // hash 保护不可改）的 Send()/Connect() 无超时，对端停收时 send() 会永久
@@ -1388,6 +1394,21 @@ private:
         while (true) {
             for (int i = 0; i < 10; ++i) {  // 10s tick，期间每秒喂 TWDT
                 esp_task_wdt_reset();
+                // 派单后收线：见 bridge_close_session_ 注释。Speaking 状态
+                // （云端抢答 TTS 还在被 abort）等下一秒再看；Listening 立即
+                // 停止聆听回 idle，让桥接回执能播。
+                int close = self->bridge_close_session_.load();
+                if (close > 0) {
+                    int st = self->GetDeviceStateSafe();
+                    if (st == kDeviceStateListening) {
+                        Application::GetInstance().StopListening();
+                        self->bridge_close_session_.store(0);
+                    } else if (st == kDeviceStateIdle) {
+                        self->bridge_close_session_.store(0);
+                    } else {
+                        self->bridge_close_session_.store(close - 1);
+                    }
+                }
                 vTaskDelay(pdMS_TO_TICKS(1000));
             }
             if (!self->BridgeEnabled()) {
@@ -1940,6 +1961,11 @@ public:
         bool accepted = resp.find("accepted") != std::string::npos;
         ESP_LOGI(TAG, "Router: bridge %s", accepted ? "accepted the task"
                  : (resp.empty() ? "unreachable, let cloud answer" : resp.substr(0, 60).c_str()));
+        if (accepted) {
+            // 派单成功：给 BridgeTask 15s 窗口把当前会话收线回 idle，
+            // 好让桥接的接单回执（≤10s 轮询）能立刻播出来。
+            bridge_close_session_.store(15);
+        }
         return accepted;
     }
 
