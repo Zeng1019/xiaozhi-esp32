@@ -25,6 +25,7 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <atomic>
 #include <cstring>
 
 #include "usb/usb_host.h"
@@ -125,6 +126,12 @@ private:
     int led_brightness_ = 128;  // 0-255 master scale for the LED ring
 #if CLAW_SERVO_POSITIONAL
     int servo_angle_ = 90;  // 0-180 degrees, SG90 positional servo holds here
+    // ---- 人脸跟踪（2026-10-14 舵机云台 v1）----
+    // 摄像头装在 SG90 摆臂上：跟踪任务以 ~3fps 抓拍上传 /vision
+    // (X-Photo-Type: track)，桥接跑 YuNet 算人脸偏移，在 HTTP 响应里
+    // 回 {"servo": 角度}，本端转动——一帧一闭环。开关经 /pending 领单。
+    std::atomic<bool> tracking_{false};
+    int track_fail_ = 0;  // 连续上传失败计数，>8 次自动停止
 #else
     int servo_speed_ = 0;  // -100..100 percent, 0 = stopped
 #endif
@@ -1285,6 +1292,102 @@ private:
         return okw && status == 200;
     }
 
+#if CLAW_SERVO_POSITIONAL
+    // ---- 人脸跟踪（2026-10-14 舵机云台 v1）----
+    void SetServoAngleDirect(int angle) {
+        if (angle < 0) angle = 0;
+        if (angle > 180) angle = 180;
+        servo_angle_ = angle;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, ServoDuty(servo_angle_));
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    }
+
+    // 一帧闭环：抓拍 -> 上传 /vision(track) -> 解析 {"servo": N} -> 转动。
+    // 与 BridgeUploadPhoto 的区别：预览在整段跟踪期间保持关闭（3fps 逐帧
+    // 开关会让屏幕狂闪），失败计数超限自动停止，忙时跳帧不抢音频。
+    void TrackingStep() {
+        if (esp_video_ == nullptr) { tracking_ = false; return; }
+        if (GetDeviceStateSafe() != kDeviceStateIdle) return;
+
+        esp_video_->SetPreviewEnabled(false);
+        bool ok = esp_video_->Capture();
+        std::vector<uint8_t> jpeg;
+        uint16_t jw = 0, jh = 0;
+        if (ok) ok = esp_video_->GetLastJpegFrame(jpeg, &jw, &jh);
+        if (!ok || jpeg.empty()) return;  // 预览保持关闭，循环结束统一恢复
+
+        auto network = GetNetwork();
+        if (network == nullptr) return;
+        auto http = network->CreateHttp(3);
+        if (http == nullptr) return;
+        std::string boundary = "----ESP32_CLAW_BOUNDARY";
+        if (!bridge_token_.empty()) http->SetHeader("X-Device-Token", bridge_token_);
+        http->SetHeader("X-Photo-Type", "track");
+        http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+        http->SetHeader("Transfer-Encoding", "chunked");
+        http->SetTimeout(3000);
+        if (auto opened = http->Open("POST", bridge_url_ + "/vision"); !opened) {
+            BridgeHttpSettle(http);
+            if (++track_fail_ > 8) {
+                ESP_LOGW(TAG, "Tracking: bridge unreachable, auto stop");
+                tracking_ = false;
+            }
+            return;
+        }
+        std::string head;
+        head += "--" + boundary + "\r\n";
+        head += "Content-Disposition: form-data; name=\"question\"\r\n\r\n\r\n";
+        head += "--" + boundary + "\r\n";
+        head += "Content-Disposition: form-data; name=\"file\"; filename=\"track.jpg\"\r\n";
+        head += "Content-Type: image/jpeg\r\n\r\n";
+        std::string tail = "\r\n--" + boundary + "--\r\n";
+        bool okw = true;
+        if (auto w = http->Write(head.c_str(), head.size()); !w) okw = false;
+        if (okw && !jpeg.empty()) {
+            if (auto w = http->Write((const char*)jpeg.data(), jpeg.size()); !w) okw = false;
+        }
+        if (okw) {
+            if (auto w = http->Write(tail.c_str(), tail.size()); !w) okw = false;
+        }
+        if (okw) {
+            if (auto w = http->Write("", 0); !w) okw = false;  // 结束 chunk
+        }
+        int status = 0;
+        if (auto sc = http->GetStatusCode()) status = sc.value();
+        std::string body = (status == 200) ? http->ReadAll() : std::string();
+        BridgeHttpSettle(http);
+        if (status != 200) {
+            if (++track_fail_ > 8) {
+                ESP_LOGW(TAG, "Tracking: bad status %d, auto stop", status);
+                tracking_ = false;
+            }
+            return;
+        }
+        track_fail_ = 0;
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (root != nullptr) {
+            const cJSON* js = cJSON_GetObjectItem(root, "servo");
+            if (js && cJSON_IsNumber(js)) SetServoAngleDirect(js->valueint);
+            cJSON_Delete(root);
+        }
+    }
+
+    static void TrackingTask(void* arg) {
+        auto* self = static_cast<EspClawBoard*>(arg);
+        ESP_LOGI(TAG, "Face tracking: start, servo centered");
+        self->SetServoAngleDirect(90);
+        vTaskDelay(pdMS_TO_TICKS(400));
+        while (self->tracking_) {
+            self->TrackingStep();
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        self->SetServoAngleDirect(90);
+        if (self->esp_video_ != nullptr) self->esp_video_->SetPreviewEnabled(true);
+        ESP_LOGI(TAG, "Face tracking: stopped, servo centered");
+        vTaskDelete(nullptr);
+    }
+#endif
+
     // Push a sentinel event to the bridge (dashboard log + speech queue).
     void BridgeNotify(const std::string& type, const std::string& message) {
         if (!BridgeEnabled()) return;
@@ -1332,6 +1435,25 @@ private:
                 }
                 break;
             }
+            // 人脸跟踪开关（2026-10-14）：桥接 /tracking/start|stop 下发
+#if CLAW_SERVO_POSITIONAL
+            if (type == "tracking") {
+                bool want_on = (msg == "on");
+                if (want_on && !tracking_) {
+                    tracking_ = true;
+                    BridgeAckAll();
+                    xTaskCreate(TrackingTask, "face_track", 8192, this, 1, nullptr);
+                    ESP_LOGI(TAG, "Bridge: face tracking ON");
+                } else if (!want_on && tracking_) {
+                    tracking_ = false;  // 循环退出后自动回中、恢复预览
+                    BridgeAckAll();
+                    ESP_LOGI(TAG, "Bridge: face tracking OFF");
+                } else {
+                    BridgeAckAll();
+                }
+                break;
+            }
+#endif
             if (type == "speak" || type == "remind_standup") {
                 std::string tts_resp = BridgeHttpGet(
                     bridge_url_ + "/tts/url?text=" + BridgeUrlEncode(msg));
