@@ -126,6 +126,7 @@ private:
     int led_brightness_ = 128;  // 0-255 master scale for the LED ring
 #if CLAW_SERVO_POSITIONAL
     int servo_angle_ = 90;  // 0-180 degrees, SG90 positional servo holds here
+    int tilt_angle_ = 90;   // 0-180 degrees, second servo (pan-tilt TILT axis, GPIO48)
     // ---- 人脸跟踪（2026-10-14 舵机云台 v1）----
     // 摄像头装在 SG90 摆臂上：跟踪任务以 ~3fps 抓拍上传 /vision
     // (X-Photo-Type: track)，桥接跑 YuNet 算人脸偏移，在 HTTP 响应里
@@ -328,7 +329,24 @@ private:
             ESP_LOGE(TAG, "Servo channel config failed on GPIO%d", CLAW_SERVO_GPIO);
             return;
         }
-        ESP_LOGI(TAG, "Positional servo (SG90) ready on GPIO%d, holding 90 deg", CLAW_SERVO_GPIO);
+        // 第二路舵机（俯仰轴）：共用 TIMER_1，走 CHANNEL_2
+        ledc_channel_config_t tilt_ch = {
+            .gpio_num = CLAW_SERVO2_GPIO,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = LEDC_CHANNEL_2,
+            .timer_sel = LEDC_TIMER_1,
+            .duty = ServoDuty(tilt_angle_),
+            .hpoint = 0,
+            .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
+            .flags = { .output_invert = 0 },
+            .deconfigure = false,
+        };
+        if (ledc_channel_config(&tilt_ch) != ESP_OK) {
+            ESP_LOGE(TAG, "Tilt servo channel config failed on GPIO%d", CLAW_SERVO2_GPIO);
+            return;
+        }
+        ESP_LOGI(TAG, "Positional servos ready: pan GPIO%d, tilt GPIO%d, holding 90 deg",
+                 CLAW_SERVO_GPIO, CLAW_SERVO2_GPIO);
     }
 #else
     // The attached servo is a 360-degree CONTINUOUS-ROTATION type (confirmed
@@ -1302,6 +1320,15 @@ private:
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
     }
 
+    // 俯仰轴（第二路舵机，2026-10-16 二维云台）
+    void SetTiltAngleDirect(int angle) {
+        if (angle < 0) angle = 0;
+        if (angle > 180) angle = 180;
+        tilt_angle_ = angle;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, ServoDuty(tilt_angle_));
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
+    }
+
     // 一帧闭环：抓拍 -> 上传 /vision(track) -> 解析 {"servo": N} -> 转动。
     // 与 BridgeUploadPhoto 的区别：预览在整段跟踪期间保持关闭（3fps 逐帧
     // 开关会让屏幕狂闪），失败计数超限自动停止，忙时跳帧不抢音频。
@@ -1368,22 +1395,26 @@ private:
         if (root != nullptr) {
             const cJSON* js = cJSON_GetObjectItem(root, "servo");
             if (js && cJSON_IsNumber(js)) SetServoAngleDirect(js->valueint);
+            const cJSON* jt = cJSON_GetObjectItem(root, "tilt");
+            if (jt && cJSON_IsNumber(jt)) SetTiltAngleDirect(jt->valueint);
             cJSON_Delete(root);
         }
     }
 
     static void TrackingTask(void* arg) {
         auto* self = static_cast<EspClawBoard*>(arg);
-        ESP_LOGI(TAG, "Face tracking: start, servo centered");
+        ESP_LOGI(TAG, "Face tracking: start, pan/tilt centered");
         self->SetServoAngleDirect(90);
+        self->SetTiltAngleDirect(90);
         vTaskDelay(pdMS_TO_TICKS(400));
         while (self->tracking_) {
             self->TrackingStep();
             vTaskDelay(pdMS_TO_TICKS(200));
         }
         self->SetServoAngleDirect(90);
+        self->SetTiltAngleDirect(90);
         if (self->esp_video_ != nullptr) self->esp_video_->SetPreviewEnabled(true);
-        ESP_LOGI(TAG, "Face tracking: stopped, servo centered");
+        ESP_LOGI(TAG, "Face tracking: stopped, pan/tilt centered");
         vTaskDelete(nullptr);
     }
 #endif
@@ -1453,14 +1484,18 @@ private:
                 }
                 break;
             }
-            // 直接设舵机角度（2026-10-16）：桥接 /servo 下发，msg = "0".."180"
+            // 直接设舵机角度（2026-10-16）：桥接 /servo 下发。
+            // msg = "h"（只动水平）或 "h,v"（二维云台）。
             if (type == "servo") {
                 int a = atoi(msg.c_str());
-                if (a < 0) a = 0;
-                if (a > 180) a = 180;
                 SetServoAngleDirect(a);
+                const char* comma = strchr(msg.c_str(), ',');
+                if (comma != nullptr) {
+                    SetTiltAngleDirect(atoi(comma + 1));
+                }
                 BridgeAckAll();
-                ESP_LOGI(TAG, "Bridge: servo -> %d deg", a);
+                ESP_LOGI(TAG, "Bridge: servo -> %d deg, tilt -> %d deg",
+                         servo_angle_, tilt_angle_);
                 break;
             }
 #endif
@@ -1674,13 +1709,24 @@ private:
                 return true;
             });
 
+        mcp_server.AddTool("self.servo.set_tilt",
+            "Set the pan-tilt TILT servo (second servo, GPIO48) to an absolute "
+            "angle. tilt: 0-180 degrees (90 = level). The servo moves there and "
+            "HOLDS the position.",
+            PropertyList({
+                Property("tilt", kPropertyTypeInteger, 0, 180),
+            }), [this](const PropertyList& properties) -> ReturnValue {
+                SetTiltAngleDirect(properties["tilt"].value<int>());
+                ESP_LOGI(TAG, "Servo tilt %d deg", tilt_angle_);
+                return true;
+            });
+
         mcp_server.AddTool("self.servo.stop",
-            "Return the servo horn to center position (90 degrees).",
+            "Return both pan and tilt servos to center position (90 degrees).",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-                servo_angle_ = 90;
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, ServoDuty(90));
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-                ESP_LOGI(TAG, "Servo centered (90 deg)");
+                SetServoAngleDirect(90);
+                SetTiltAngleDirect(90);
+                ESP_LOGI(TAG, "Servos centered (pan 90, tilt 90 deg)");
                 return true;
             });
 #else

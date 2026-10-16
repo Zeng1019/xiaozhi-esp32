@@ -47,6 +47,8 @@
 #define CLAW_LED_STRIP_GPIO   GPIO_NUM_13
 #define CLAW_LED_STRIP_NUM    16
 #define CLAW_SERVO_GPIO       GPIO_NUM_47
+// 第二路舵机（2026-10-16 云台俯仰轴）：GPIO48 在右侧排针紧挨 47，固件未占用。
+#define CLAW_SERVO2_GPIO      GPIO_NUM_48
 
 // Servo type: 1 = positional servo (SG90, 0-180 degrees, pulse = position,
 // holds wherever it is told to go); 0 = 360-degree continuous-rotation servo
