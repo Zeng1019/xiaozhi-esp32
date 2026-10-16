@@ -1453,6 +1453,16 @@ private:
                 }
                 break;
             }
+            // 直接设舵机角度（2026-10-16）：桥接 /servo 下发，msg = "0".."180"
+            if (type == "servo") {
+                int a = atoi(msg.c_str());
+                if (a < 0) a = 0;
+                if (a > 180) a = 180;
+                SetServoAngleDirect(a);
+                BridgeAckAll();
+                ESP_LOGI(TAG, "Bridge: servo -> %d deg", a);
+                break;
+            }
 #endif
             if (type == "speak" || type == "remind_standup") {
                 std::string tts_resp = BridgeHttpGet(
