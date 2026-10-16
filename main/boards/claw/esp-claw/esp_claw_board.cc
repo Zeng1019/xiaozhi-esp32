@@ -1714,9 +1714,10 @@ private:
 
         mcp_server.AddTool("self.servo.set_tilt",
             "Set the TILT servo (vertical axis, up-down, GPIO48) to an "
-            "absolute angle. tilt: 0-180 degrees (0 = highest, looking all "
-            "the way up; 180 = lowest, looking all the way down; 90 = level). "
-            "The servo moves there and HOLDS the position.",
+            "absolute angle. tilt: 0-180 degrees. 90 = level. LARGER tilt = "
+            "look UP (e.g. 135 = looking up), SMALLER tilt = look DOWN "
+            "(e.g. 45 = looking down). The servo moves there and HOLDS the "
+            "position.",
             PropertyList({
                 Property("tilt", kPropertyTypeInteger, 0, 180),
             }), [this](const PropertyList& properties) -> ReturnValue {
