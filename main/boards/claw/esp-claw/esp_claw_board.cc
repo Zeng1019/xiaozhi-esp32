@@ -34,6 +34,7 @@
 #include "jpg/jpeg_to_image.h"
 #include <driver/ledc.h>
 #include <led_strip.h>
+#include <esp_wifi.h>
 #include <cstdlib>
 #include <cJSON.h>
 
@@ -2188,6 +2189,28 @@ public:
         InitializeSentinel();
         InitializeBridge();
         GetBacklight()->RestoreBrightness();
+    }
+
+    // 桌面机器人常供电（2026-10-16）：连上 WiFi 后彻底关掉省电。
+    // esp_wifi 默认 WIFI_PS_MIN_MODEM，每次 TCP 往返要多睡一个 DTIM 周期
+    // （100~300ms），人脸跟踪闭环每帧要背 2~3 次这种等待，是"一卡一卡"的
+    // 主因。关掉后 HTTP 往返稳定在几十 ms 级。
+    void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        xTaskCreate([](void*) {
+            wifi_ap_record_t ap;
+            for (int i = 0; i < 120; i++) {  // 最多等 60s 连接成功
+                if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+                    esp_wifi_set_ps(WIFI_PS_NONE);
+                    ESP_LOGI(TAG, "WiFi power save OFF (PERFORMANCE, latency mode)");
+                    vTaskDelete(nullptr);
+                    return;
+                }
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            ESP_LOGW(TAG, "WiFi connect timeout, power save left default");
+            vTaskDelete(nullptr);
+        }, "wifi_ps", 3072, this, 1, nullptr);
     }
 
     virtual Led* GetLed() override {
