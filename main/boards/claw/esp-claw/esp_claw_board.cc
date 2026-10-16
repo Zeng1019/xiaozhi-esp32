@@ -1695,24 +1695,23 @@ private:
         // --- Servo (positional SG90 on GPIO47) ---
         // Pulse width = absolute position. The horn STAYS at the commanded
         // angle (PWM keeps flowing) — no auto-return, no timed spin.
-        mcp_server.AddTool("self.servo.set_angle",
-            "Set the servo horn to an absolute angle. angle: 0-180 degrees "
-            "(90 = center). The servo moves there and HOLDS the position — "
-            "it does not drift back. Use for pointing, waving, pushing etc.",
+        // --- Servo tools (2026-10-16 二维云台：水平 pan / 俯仰 tilt 分轴独立控制) ---
+        mcp_server.AddTool("self.servo.set_pan",
+            "Set the PAN servo (horizontal axis, left-right, GPIO47) to an "
+            "absolute angle. angle: 0-180 degrees (90 = facing straight "
+            "ahead). The servo moves there and HOLDS the position.",
             PropertyList({
                 Property("angle", kPropertyTypeInteger, 0, 180),
             }), [this](const PropertyList& properties) -> ReturnValue {
-                servo_angle_ = properties["angle"].value<int>();
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, ServoDuty(servo_angle_));
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-                ESP_LOGI(TAG, "Servo angle %d deg", servo_angle_);
+                SetServoAngleDirect(properties["angle"].value<int>());
+                ESP_LOGI(TAG, "Servo pan %d deg", servo_angle_);
                 return true;
             });
 
         mcp_server.AddTool("self.servo.set_tilt",
-            "Set the pan-tilt TILT servo (second servo, GPIO48) to an absolute "
-            "angle. tilt: 0-180 degrees (90 = level). The servo moves there and "
-            "HOLDS the position.",
+            "Set the TILT servo (vertical axis, up-down, GPIO48) to an "
+            "absolute angle. tilt: 0-180 degrees (90 = level). Larger tilt = "
+            "look up. The servo moves there and HOLDS the position.",
             PropertyList({
                 Property("tilt", kPropertyTypeInteger, 0, 180),
             }), [this](const PropertyList& properties) -> ReturnValue {
