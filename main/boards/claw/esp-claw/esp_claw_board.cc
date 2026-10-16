@@ -1430,20 +1430,21 @@ private:
 
     static void TrackingTask(void* arg) {
         auto* self = static_cast<EspClawBoard*>(arg);
-        ESP_LOGI(TAG, "Face tracking: start, pan/tilt centered");
+        ESP_LOGI(TAG, "Face tracking: start, pan/tilt to home pose");
         self->esp_video_->SetCaptureDqbufCount(1);  // 低延迟：直取帧，省 ~300ms/次
-        self->SetServoAngleDirect(90);
-        self->SetTiltAngleDirect(90);
+        self->SetServoAngleDirect(CLAW_SERVO_HOME_PAN);
+        self->SetTiltAngleDirect(CLAW_SERVO_HOME_TILT);
         vTaskDelay(pdMS_TO_TICKS(400));
         while (self->tracking_) {
             self->TrackingStep();
             vTaskDelay(pdMS_TO_TICKS(30));  // SmoothMoveTo 自带节拍，这里只留小间隙
         }
         self->esp_video_->SetCaptureDqbufCount(3);  // 恢复默认
-        self->SetServoAngleDirect(90);
-        self->SetTiltAngleDirect(90);
+        // 归位到待机姿态（2026-10-17：100/80 正对主人常坐位，非机械中位）
+        self->SetServoAngleDirect(CLAW_SERVO_HOME_PAN);
+        self->SetTiltAngleDirect(CLAW_SERVO_HOME_TILT);
         if (self->esp_video_ != nullptr) self->esp_video_->SetPreviewEnabled(true);
-        ESP_LOGI(TAG, "Face tracking: stopped, pan/tilt centered");
+        ESP_LOGI(TAG, "Face tracking: stopped, pan/tilt at home pose");
         vTaskDelete(nullptr);
     }
 #endif
