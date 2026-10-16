@@ -8,6 +8,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <atomic>
 #include <memory>
+#include <string>
 
 #define PREVIEW_IMAGE_DURATION_MS 5000
 
@@ -27,6 +28,7 @@ protected:
     lv_obj_t* emoji_label_ = nullptr;
     lv_obj_t* emoji_image_ = nullptr;
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
+    std::string current_emotion_;  // 2026-10-16: 相同表情重复下发时跳过，避免 GIF 无谓重启
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;

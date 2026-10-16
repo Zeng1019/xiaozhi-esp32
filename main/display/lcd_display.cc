@@ -1144,6 +1144,12 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         return;
     }
 
+    // 2026-10-16: 相同表情重复下发时直接跳过，避免 GIF 动画被无谓重启
+    if (current_emotion_ == emotion) {
+        return;
+    }
+    current_emotion_ = emotion;
+
     auto emoji_collection = static_cast<LvglTheme*>(current_theme_)->emoji_collection();
     auto image = emoji_collection != nullptr ? emoji_collection->GetEmojiImage(emotion) : nullptr;
     if (image == nullptr) {
