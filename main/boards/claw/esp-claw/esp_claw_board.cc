@@ -1397,11 +1397,33 @@ private:
         track_fail_ = 0;
         cJSON* root = cJSON_Parse(body.c_str());
         if (root != nullptr) {
+            int target_pan = servo_angle_;
+            int target_tilt = tilt_angle_;
             const cJSON* js = cJSON_GetObjectItem(root, "servo");
-            if (js && cJSON_IsNumber(js)) SetServoAngleDirect(js->valueint);
+            if (js && cJSON_IsNumber(js)) target_pan = js->valueint;
             const cJSON* jt = cJSON_GetObjectItem(root, "tilt");
-            if (jt && cJSON_IsNumber(jt)) SetTiltAngleDirect(jt->valueint);
+            if (jt && cJSON_IsNumber(jt)) target_tilt = jt->valueint;
             cJSON_Delete(root);
+            SmoothMoveTo(target_pan, target_tilt);
+        }
+    }
+
+    // 平滑逼近目标角度（2026-10-16）：每 20ms 各轴最多走 2°，把一帧跳 6°
+    // 的顿挫摊成连续滑动。总时长上限 ~260ms 防大角度差时卡住闭环。
+    void SmoothMoveTo(int target_pan, int target_tilt) {
+        for (int i = 0; i < 13; i++) {
+            if (servo_angle_ == target_pan && tilt_angle_ == target_tilt) break;
+            if (servo_angle_ < target_pan) {
+                SetServoAngleDirect(target_pan - servo_angle_ > 2 ? servo_angle_ + 2 : target_pan);
+            } else if (servo_angle_ > target_pan) {
+                SetServoAngleDirect(servo_angle_ - target_pan > 2 ? servo_angle_ - 2 : target_pan);
+            }
+            if (tilt_angle_ < target_tilt) {
+                SetTiltAngleDirect(target_tilt - tilt_angle_ > 2 ? tilt_angle_ + 2 : target_tilt);
+            } else if (tilt_angle_ > target_tilt) {
+                SetTiltAngleDirect(tilt_angle_ - target_tilt > 2 ? tilt_angle_ - 2 : target_tilt);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
 
@@ -1413,7 +1435,7 @@ private:
         vTaskDelay(pdMS_TO_TICKS(400));
         while (self->tracking_) {
             self->TrackingStep();
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(30));  // SmoothMoveTo 自带节拍，这里只留小间隙
         }
         self->SetServoAngleDirect(90);
         self->SetTiltAngleDirect(90);
