@@ -1321,11 +1321,15 @@ private:
     }
 
     // 俯仰轴（第二路舵机，2026-10-16 二维云台）
+    // 逻辑角约定（用户实测装配 2026-10-16）：0 = 最高点（抬头到顶），
+    // 180 = 最低点（低头到底），90 = 水平。物理舵机反向，这里统一翻转，
+    // 语音 / /servo / 跟踪三条路全部走本函数，约定一致。
     void SetTiltAngleDirect(int angle) {
         if (angle < 0) angle = 0;
         if (angle > 180) angle = 180;
         tilt_angle_ = angle;
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, ServoDuty(tilt_angle_));
+        int physical = 180 - angle;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, ServoDuty(physical));
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
     }
 
@@ -1710,8 +1714,9 @@ private:
 
         mcp_server.AddTool("self.servo.set_tilt",
             "Set the TILT servo (vertical axis, up-down, GPIO48) to an "
-            "absolute angle. tilt: 0-180 degrees (90 = level). Larger tilt = "
-            "look up. The servo moves there and HOLDS the position.",
+            "absolute angle. tilt: 0-180 degrees (0 = highest, looking all "
+            "the way up; 180 = lowest, looking all the way down; 90 = level). "
+            "The servo moves there and HOLDS the position.",
             PropertyList({
                 Property("tilt", kPropertyTypeInteger, 0, 180),
             }), [this](const PropertyList& properties) -> ReturnValue {
