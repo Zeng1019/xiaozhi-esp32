@@ -442,7 +442,9 @@ bool EspVideo::Capture() {
         return false;
     }
 
-    for (int i = 0; i < 3; i++) {
+    // 2026-10-16: DQBUF 次数可调（默认 3=丢2帧保新鲜；跟踪时设 1 省两帧等待）
+    int dq_count = capture_dqbuf_count_;
+    for (int i = 0; i < dq_count; i++) {
         struct v4l2_buffer buf = {};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
@@ -450,7 +452,7 @@ bool EspVideo::Capture() {
             ESP_LOGE(TAG, "VIDIOC_DQBUF failed");
             return false;
         }
-        if (i == 2) {
+        if (i == dq_count - 1) {
             // 保存帧副本到PSRAM
             if (frame_.data) {
                 heap_caps_free(frame_.data);

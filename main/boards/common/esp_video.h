@@ -49,6 +49,9 @@ private:
     // and reallocated inside Capture().
     std::mutex capture_mutex_;
     std::atomic<bool> preview_enabled_{true};
+    // Capture() 内部丢弃的旧帧数：默认 3 次 DQBUF（拍新帧最稳）。
+    // 低延迟场景（人脸跟踪）可设 1，省掉两帧等待，~300ms/次。
+    int capture_dqbuf_count_ = 3;
 
 public:
     EspVideo(const esp_video_init_config_t& config);
@@ -68,4 +71,6 @@ public:
     // Suppress the LVGL preview path in Capture() (skips the full-frame
     // decode + alloc); used by low-rate background watchers.
     void SetPreviewEnabled(bool enabled) { preview_enabled_.store(enabled); }
+    // 2026-10-16: Capture() 内部 DQBUF 次数（1=直取最浅延迟，3=默认最稳）
+    void SetCaptureDqbufCount(int n) { capture_dqbuf_count_ = n < 1 ? 1 : n; }
 };
