@@ -55,9 +55,9 @@
 // (pulse = speed/direction, 1500 us = stop). Set to 0 if you swap back.
 #define CLAW_SERVO_POSITIONAL 1
 
-// 待机归位姿态（2026-10-17 用户定）：跟踪丢失/停止后回到 水平100°、俯仰80°
-// （这个角度正对主人常坐的位置，比机械中位 90/90 更快重新看到人）。
+// 待机归位姿态（2026-10-17 用户定）：跟踪丢失/停止后回到 水平100°、俯仰110°
+// （俯仰约定：角度越大越抬头；80 太低对着桌面，110 才正对主人常坐的位置）。
 #define CLAW_SERVO_HOME_PAN   100
-#define CLAW_SERVO_HOME_TILT  80
+#define CLAW_SERVO_HOME_TILT  110
 
 #endif // _BOARD_CONFIG_H_
