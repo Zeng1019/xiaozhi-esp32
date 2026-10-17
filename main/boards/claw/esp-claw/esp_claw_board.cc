@@ -202,12 +202,11 @@ private:
         esp_video_init_config_t video_config = {
             .usb_uvc = &usb_uvc_config,
         };
-        // 2026-10-17 跟踪提速：实测 640x480 下采集一帧要 144-190ms（相机
-        // 实际出帧 ~7fps，USB 传 45KB 大帧拖累）。480x320 档 MJPEG 帧小一半，
-        // 采集等待明显缩短。注意：在座判定阈值按 640x480 标定，换档后要重验。
-        EspVideo::SetPreferredSize(480, 320);
-        // 相机档位矩阵（2026-10-17 枚举）：480x320 支持 25/15fps，默认 15fps
-        // 实测实出 ~7.5fps。25fps interval=400000 在描述符里精确匹配。
+        // 2026-10-17 实验：曾试 480x320 提跟踪帧率（JPEG 45->16KB），但 3:2
+        // 画幅垂直视野变窄、人脸像素变小，在座判定/陌生人识别全跑偏，用户
+        // 叫停回退 640x480。分辨率是识别链路的根，别为跟踪速度动它。
+        // 实测室内自动曝光下相机实出 ~7.5fps，是跟踪闭环的物理天花板。
+        // 640x480 档支持 25/15fps，默认 15，请求 25（强光下能受益）。
         EspVideo::SetPreferredFps(25);
         camera_ = new EspVideo(video_config);
         esp_video_ = static_cast<EspVideo*>(camera_);
