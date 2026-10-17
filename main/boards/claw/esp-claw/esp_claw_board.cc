@@ -202,6 +202,13 @@ private:
         esp_video_init_config_t video_config = {
             .usb_uvc = &usb_uvc_config,
         };
+        // 2026-10-17 跟踪提速：实测 640x480 下采集一帧要 144-190ms（相机
+        // 实际出帧 ~7fps，USB 传 45KB 大帧拖累）。480x320 档 MJPEG 帧小一半，
+        // 采集等待明显缩短。注意：在座判定阈值按 640x480 标定，换档后要重验。
+        EspVideo::SetPreferredSize(480, 320);
+        // 相机档位矩阵（2026-10-17 枚举）：480x320 支持 25/15fps，默认 15fps
+        // 实测实出 ~7.5fps。25fps interval=400000 在描述符里精确匹配。
+        EspVideo::SetPreferredFps(25);
         camera_ = new EspVideo(video_config);
         esp_video_ = static_cast<EspVideo*>(camera_);
         ESP_LOGI(TAG, "USB UVC camera initialized");
@@ -1438,16 +1445,20 @@ private:
         if (GetDeviceStateSafe() != kDeviceStateIdle) return;
 
         esp_video_->SetPreviewEnabled(false);
+        int64_t t0 = esp_timer_get_time();
         bool ok = esp_video_->Capture();
         std::vector<uint8_t> jpeg;
         uint16_t jw = 0, jh = 0;
         if (ok) ok = esp_video_->GetLastJpegFrame(jpeg, &jw, &jh);
+        int64_t t1 = esp_timer_get_time();
         if (!ok || jpeg.empty()) return;  // 预览保持关闭，循环结束统一恢复
 
         int target_pan = servo_angle_;
         int target_tilt = tilt_angle_;
         bool off = false;
         if (!StreamStep(jpeg, &target_pan, &target_tilt, &off)) {
+            int64_t t2 = esp_timer_get_time();
+            ESP_LOGW(TAG, "track: cap=%lldms stream_fail=%lldms", (t1-t0)/1000, (t2-t1)/1000);
             if (++track_fail_ > 8) {
                 ESP_LOGW(TAG, "Tracking: stream unreachable, auto stop");
                 tracking_ = false;
@@ -1460,11 +1471,15 @@ private:
             return;
         }
         track_fail_ = 0;
+        int64_t t2 = esp_timer_get_time();
+        // 排查帧率上限用（2026-10-17）：采集 vs 流传输分段耗时，稳定后删
+        ESP_LOGI(TAG, "track: cap=%lldms stream=%lldms jpeg=%uB",
+                 (t1-t0)/1000, (t2-t1)/1000, (unsigned)jpeg.size());
         SmoothMoveTo(target_pan, target_tilt);
     }
 
-    // 平滑逼近目标角度（2026-10-16）：每 20ms 各轴最多走 2°，把一帧跳 6°
-    // 的顿挫摊成连续滑动。总时长上限 ~260ms 防大角度差时卡住闭环。
+    // 平滑逼近目标角度（2026-10-16）：每 10ms 各轴最多走 2°，把一帧跳 6°
+    // 的顿挫摊成连续滑动。总时长上限 ~130ms 防大角度差时卡住闭环。
     void SmoothMoveTo(int target_pan, int target_tilt) {
         for (int i = 0; i < 13; i++) {
             if (servo_angle_ == target_pan && tilt_angle_ == target_tilt) break;
@@ -1478,7 +1493,7 @@ private:
             } else if (tilt_angle_ > target_tilt) {
                 SetTiltAngleDirect(tilt_angle_ - target_tilt > 2 ? tilt_angle_ - 2 : target_tilt);
             }
-            vTaskDelay(pdMS_TO_TICKS(20));
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 
@@ -1491,7 +1506,7 @@ private:
         vTaskDelay(pdMS_TO_TICKS(400));
         while (self->tracking_) {
             self->TrackingStep();
-            vTaskDelay(pdMS_TO_TICKS(30));  // SmoothMoveTo 自带节拍，这里只留小间隙
+            vTaskDelay(pdMS_TO_TICKS(15));  // SmoothMoveTo 自带节拍，这里只留小间隙
         }
         self->esp_video_->SetCaptureDqbufCount(3);  // 恢复默认
         self->StreamClose();                        // 关跟踪视频流连接

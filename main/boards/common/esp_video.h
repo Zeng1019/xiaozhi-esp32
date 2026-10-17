@@ -73,4 +73,20 @@ public:
     void SetPreviewEnabled(bool enabled) { preview_enabled_.store(enabled); }
     // 2026-10-16: Capture() 内部 DQBUF 次数（1=直取最浅延迟，3=默认最稳）
     void SetCaptureDqbufCount(int n) { capture_dqbuf_count_ = n < 1 ? 1 : n; }
+    // 2026-10-17: 请求更低的相机分辨率档位（在构造前调用）。相机实际档位
+    // 有限（本机支持 1280x720/800x480/640x480/480x320），S_FMT 被拒时
+    // 自动保持相机默认档。分辨率影响所有照片路径（在座判定阈值按 640x480
+    // 标定，改档后需重新验证）。
+    static void SetPreferredSize(int width, int height) {
+        s_pref_width_ = width;
+        s_pref_height_ = height;
+    }
+    // 2026-10-17: 请求相机帧率档（低光下 UVC 相机常自动降到 7.5fps）。
+    // 强制高帧率在暗处会缩短曝光、画面变暗——脸检测变差时改回去。
+    static void SetPreferredFps(int fps) { s_pref_fps_ = fps; }
+
+private:
+    static int s_pref_width_;
+    static int s_pref_height_;
+    static int s_pref_fps_;
 };

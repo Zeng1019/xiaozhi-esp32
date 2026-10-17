@@ -55,6 +55,10 @@
 
 #define TAG "EspVideo"
 
+int EspVideo::s_pref_width_ = 0;   // 板级请求的相机分辨率（0 = 用相机默认档）
+int EspVideo::s_pref_height_ = 0;
+int EspVideo::s_pref_fps_ = 0;     // 板级请求的相机帧率（0 = 相机自动）
+
 #if CONFIG_XIAOZHI_CAMERA_MIRROR_CONFIGURED
 #if CONFIG_XIAOZHI_CAMERA_HMIRROR
 static constexpr bool kConfiguredHMirror = true;
@@ -187,6 +191,11 @@ EspVideo::EspVideo(const esp_video_init_config_t& config) {
              format.fmt.pix.pixelformat, format.fmt.pix.width, format.fmt.pix.height);
     CAM_PRINT_FOURCC(format.fmt.pix.pixelformat);
 
+    // 枚举结果（2026-10-17 实测，排查完删掉了枚举代码）：
+    // 1280x720: 15/10fps  800x480: 20/15fps  640x480: 25/15fps  480x320: 25/15fps
+    // 默认档 15fps，室内自动曝光下实际出帧只有 ~7.5fps（采集 141ms/帧），
+    // 是跟踪闭环的物理天花板；强光下会变快。
+
     struct v4l2_format setformat = {};
     setformat.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 #ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
@@ -296,12 +305,43 @@ EspVideo::EspVideo(const esp_video_init_config_t& config) {
 
     ESP_LOGD(TAG, "selected pixel format: 0x%08lx", setformat.fmt.pix.pixelformat);
 
+    // 板级请求更低分辨率档（2026-10-17 跟踪提速）：UVC 相机每个档位的
+    // MJPEG 帧大小差异很大，小档 USB 传输快、DQBUF 等待短。被拒则回退。
+    if (s_pref_width_ > 0 && s_pref_height_ > 0) {
+        struct v4l2_format pref = setformat;
+        pref.fmt.pix.width = s_pref_width_;
+        pref.fmt.pix.height = s_pref_height_;
+        if (ioctl(video_fd_, VIDIOC_S_FMT, &pref) == 0) {
+            setformat = pref;
+            ESP_LOGW(TAG, "camera resolution -> %ux%u (preferred)",
+                     (unsigned)pref.fmt.pix.width, (unsigned)pref.fmt.pix.height);
+        } else {
+            ESP_LOGW(TAG, "preferred %dx%d rejected, keep %ux%u", s_pref_width_,
+                     s_pref_height_, (unsigned)setformat.fmt.pix.width,
+                     (unsigned)setformat.fmt.pix.height);
+        }
+    }
+
     if (ioctl(video_fd_, VIDIOC_S_FMT, &setformat) != 0) {
         ESP_LOGE(TAG, "VIDIOC_S_FMT failed, errno=%d(%s)", errno, strerror(errno));
         close(video_fd_);
         video_fd_ = -1;
         sensor_format_ = 0;
         return;
+    }
+
+    // 板级请求帧率档（2026-10-17）：低光下 UVC 相机自动降帧（实测协商
+    // 15fps 实出 ~7.5fps，采集一帧要等 141ms）。S_PARM 被拒则保持自动。
+    if (s_pref_fps_ > 0) {
+        struct v4l2_streamparm parm = {};
+        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        parm.parm.capture.timeperframe.numerator = 1;
+        parm.parm.capture.timeperframe.denominator = s_pref_fps_;
+        if (ioctl(video_fd_, VIDIOC_S_PARM, &parm) == 0) {
+            ESP_LOGW(TAG, "camera fps request -> %d", s_pref_fps_);
+        } else {
+            ESP_LOGW(TAG, "camera fps request %d rejected", s_pref_fps_);
+        }
     }
 
 #if CONFIG_XIAOZHI_CAMERA_MIRROR_CONFIGURED
