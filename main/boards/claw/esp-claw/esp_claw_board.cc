@@ -1249,7 +1249,10 @@ private:
         return resp;
     }
 
-    void BridgeAckAll() { BridgeHttpPostJson("/ack", "{}"); }
+    // 只确认当前处理的这条（index 0），不动队列后面的待办。此前 ack 会清空
+    // 整个 pending 队列，"开跟踪"领单时把同批下发的回归播报一并清掉了
+    // （2026-10-17 "离座/回归播报丢失"的根因）。
+    void BridgeAckOne() { BridgeHttpPostJson("/ack", "{\"index\":0}"); }
 
     // Capture one frame and upload it to /vision (multipart, chunked).
     bool BridgeUploadPhoto(const char* photo_type) {
@@ -1480,7 +1483,7 @@ private:
             std::string type = (jtype && jtype->valuestring) ? jtype->valuestring : "";
             std::string msg = (jmsg && jmsg->valuestring) ? jmsg->valuestring : "";
             if (msg.empty()) {
-                BridgeAckAll();
+                BridgeAckOne();
                 break;
             }
             // 桥接派单的"立即拍照复核"（2026-10-10）：哨兵离开/回归事件后
@@ -1489,7 +1492,7 @@ private:
             if (type == "photo") {
                 if (GetDeviceStateSafe() == kDeviceStateIdle) {
                     BridgeUploadPhoto("seat");
-                    BridgeAckAll();
+                    BridgeAckOne();
                     ESP_LOGI(TAG, "Bridge: on-demand verify photo uploaded");
                 } else {
                     ESP_LOGI(TAG, "Bridge: busy, verify photo retry later");
@@ -1502,15 +1505,15 @@ private:
                 bool want_on = (msg == "on");
                 if (want_on && !tracking_) {
                     tracking_ = true;
-                    BridgeAckAll();
+                    BridgeAckOne();
                     xTaskCreate(TrackingTask, "face_track", 8192, this, 1, nullptr);
                     ESP_LOGI(TAG, "Bridge: face tracking ON");
                 } else if (!want_on && tracking_) {
                     tracking_ = false;  // 循环退出后自动回中、恢复预览
-                    BridgeAckAll();
+                    BridgeAckOne();
                     ESP_LOGI(TAG, "Bridge: face tracking OFF");
                 } else {
-                    BridgeAckAll();
+                    BridgeAckOne();
                 }
                 break;
             }
@@ -1523,7 +1526,7 @@ private:
                 if (comma != nullptr) {
                     SetTiltAngleDirect(atoi(comma + 1));
                 }
-                BridgeAckAll();
+                BridgeAckOne();
                 ESP_LOGI(TAG, "Bridge: servo -> %d deg, tilt -> %d deg",
                          servo_angle_, tilt_angle_);
                 break;
@@ -1543,7 +1546,7 @@ private:
                 }
                 if (audio_url.empty()) {
                     ESP_LOGW(TAG, "Bridge: TTS synth failed, drop message");
-                    BridgeAckAll();
+                    BridgeAckOne();
                     break;
                 }
                 bridge_play_result_.store(0);
@@ -1559,7 +1562,7 @@ private:
                 bridge_play_result_.store(0);
                 if (r == 1) {
                     ESP_LOGI(TAG, "Bridge: speaking pending item (%s)", type.c_str());
-                    BridgeAckAll();
+                    BridgeAckOne();
                 } else {
                     ESP_LOGI(TAG, "Bridge: device busy, retry later");
                     // No ack: the item stays queued for the next poll.
@@ -1570,7 +1573,7 @@ private:
                 Application::GetInstance().Schedule([text]() {
                     Application::GetInstance().Alert("Bridge", text.c_str(), "neutral");
                 });
-                BridgeAckAll();
+                BridgeAckOne();
             }
         } while (false);
         cJSON_Delete(root);
