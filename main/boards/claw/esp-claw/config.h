@@ -60,4 +60,10 @@
 #define CLAW_SERVO_HOME_PAN   100
 #define CLAW_SERVO_HOME_TILT  110
 
+// 跟踪视频流 TCP 端口（2026-10-17）：跟踪帧不再逐帧 POST /vision（每帧
+// 重建 TCP + HTTP 开销把帧率压在 2-3fps），改在一条常连接上连续推帧。
+// 协议：4 字节小端帧长 + JPEG；应答 ASCII "pan,tilt\n"（跟踪已关回 "off\n"）。
+// 必须与桥接 config.yaml tracking.stream_port 一致。
+#define CLAW_BRIDGE_STREAM_PORT 8789
+
 #endif // _BOARD_CONFIG_H_

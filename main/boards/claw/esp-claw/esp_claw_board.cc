@@ -27,6 +27,9 @@
 #include <atomic>
 #include <atomic>
 #include <cstring>
+#include <cstdlib>
+#include <lwip/sockets.h>
+#include <lwip/tcp.h>
 
 #include "usb/usb_host.h"
 #include "esp_video_init.h"
@@ -129,11 +132,13 @@ private:
     int servo_angle_ = 90;  // 0-180 degrees, SG90 positional servo holds here
     int tilt_angle_ = 90;   // 0-180 degrees, second servo (pan-tilt TILT axis, GPIO48)
     // ---- 人脸跟踪（2026-10-14 舵机云台 v1）----
-    // 摄像头装在 SG90 摆臂上：跟踪任务以 ~3fps 抓拍上传 /vision
-    // (X-Photo-Type: track)，桥接跑 YuNet 算人脸偏移，在 HTTP 响应里
-    // 回 {"servo": 角度}，本端转动——一帧一闭环。开关经 /pending 领单。
+    // 摄像头装在 SG90 摆臂上：跟踪任务在一条 TCP 常连接上连续推帧
+    // （CLAW_BRIDGE_STREAM_PORT，4 字节小端帧长 + JPEG，应答 "pan,tilt\n"），
+    // 桥接跑 YuNet 算人脸偏移——一帧一闭环，无逐帧建连开销。
+    // 开关经 /pending 领单。
     std::atomic<bool> tracking_{false};
     int track_fail_ = 0;  // 连续上传失败计数，>8 次自动停止
+    int stream_fd_ = -1;  // 跟踪视频流连接（-1 = 未连接）
 #else
     int servo_speed_ = 0;  // -100..100 percent, 0 = stopped
 #endif
@@ -1337,8 +1342,96 @@ private:
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
     }
 
-    // 一帧闭环：抓拍 -> 上传 /vision(track) -> 解析 {"servo": N} -> 转动。
-    // 与 BridgeUploadPhoto 的区别：预览在整段跟踪期间保持关闭（3fps 逐帧
+    // ---- 跟踪视频流（2026-10-17）：常连接推帧替代逐帧 POST /vision ----
+    // 从 bridge_url_（"http://192.168.x.x:8787"）解析主机名，连接流端口。
+    std::string BridgeStreamHost() const {
+        static std::string cached;
+        if (cached.empty()) {
+            std::string rest = bridge_url_;
+            auto pos = rest.find("://");
+            if (pos != std::string::npos) rest = rest.substr(pos + 3);
+            auto end = rest.find_first_of(":/");
+            cached = (end == std::string::npos) ? rest : rest.substr(0, end);
+        }
+        return cached;
+    }
+
+    void StreamClose() {
+        if (stream_fd_ >= 0) {
+            close(stream_fd_);
+            stream_fd_ = -1;
+        }
+    }
+
+    bool StreamConnect() {
+        if (stream_fd_ >= 0) return true;
+        std::string host = BridgeStreamHost();
+        if (host.empty()) return false;
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return false;
+        struct timeval tv = {3, 0};  // 收发超时 3s：断线快速失败重连
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(CLAW_BRIDGE_STREAM_PORT);
+        addr.sin_addr.s_addr = inet_addr(host.c_str());
+        if (addr.sin_addr.s_addr == INADDR_NONE ||
+            connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
+            close(fd);
+            return false;
+        }
+        int nodelay = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        stream_fd_ = fd;
+        return true;
+    }
+
+    // 发一帧收一个应答。返回 false = 连接坏了（已关闭，下次重连）；
+    // 返回 true 且 off=true = 桥接说跟踪已关（应停跟踪）。
+    bool StreamStep(const std::vector<uint8_t>& jpeg, int* pan, int* tilt, bool* off) {
+        *off = false;
+        if (!StreamConnect()) return false;
+        uint32_t len = (uint32_t)jpeg.size();
+        uint8_t head[4] = {(uint8_t)(len & 0xff), (uint8_t)((len >> 8) & 0xff),
+                           (uint8_t)((len >> 16) & 0xff), (uint8_t)((len >> 24) & 0xff)};
+        size_t sent = 0;
+        while (sent < sizeof(head)) {
+            int n = send(stream_fd_, (const char*)head + sent, sizeof(head) - sent, 0);
+            if (n <= 0) { StreamClose(); return false; }
+            sent += (size_t)n;
+        }
+        size_t done = 0;
+        while (done < jpeg.size()) {
+            int n = send(stream_fd_, (const char*)jpeg.data() + done,
+                         jpeg.size() - done, 0);
+            if (n <= 0) { StreamClose(); return false; }
+            done += (size_t)n;
+        }
+        char line[64];
+        size_t used = 0;
+        while (used < sizeof(line) - 1) {
+            char c;
+            int n = recv(stream_fd_, &c, 1, 0);
+            if (n <= 0) { StreamClose(); return false; }
+            if (c == '\n') break;
+            line[used++] = c;
+        }
+        line[used] = 0;
+        if (strcmp(line, "off") == 0) {
+            *off = true;
+            return true;
+        }
+        char* comma = strchr(line, ',');
+        if (comma == nullptr) { StreamClose(); return false; }
+        *comma = 0;
+        *pan = atoi(line);
+        *tilt = atoi(comma + 1);
+        return true;
+    }
+
+    // 一帧闭环：抓拍 -> 流通道推帧 -> 解析 "pan,tilt" -> 转动。
+    // 与 BridgeUploadPhoto 的区别：预览在整段跟踪期间保持关闭（逐帧
     // 开关会让屏幕狂闪），失败计数超限自动停止，忙时跳帧不抢音频。
     void TrackingStep() {
         if (esp_video_ == nullptr) { tracking_ = false; return; }
@@ -1351,65 +1444,23 @@ private:
         if (ok) ok = esp_video_->GetLastJpegFrame(jpeg, &jw, &jh);
         if (!ok || jpeg.empty()) return;  // 预览保持关闭，循环结束统一恢复
 
-        auto network = GetNetwork();
-        if (network == nullptr) return;
-        auto http = network->CreateHttp(3);
-        if (http == nullptr) return;
-        std::string boundary = "----ESP32_CLAW_BOUNDARY";
-        if (!bridge_token_.empty()) http->SetHeader("X-Device-Token", bridge_token_);
-        http->SetHeader("X-Photo-Type", "track");
-        http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-        http->SetHeader("Transfer-Encoding", "chunked");
-        http->SetTimeout(3000);
-        if (auto opened = http->Open("POST", bridge_url_ + "/vision"); !opened) {
-            BridgeHttpSettle(http);
+        int target_pan = servo_angle_;
+        int target_tilt = tilt_angle_;
+        bool off = false;
+        if (!StreamStep(jpeg, &target_pan, &target_tilt, &off)) {
             if (++track_fail_ > 8) {
-                ESP_LOGW(TAG, "Tracking: bridge unreachable, auto stop");
+                ESP_LOGW(TAG, "Tracking: stream unreachable, auto stop");
                 tracking_ = false;
             }
             return;
         }
-        std::string head;
-        head += "--" + boundary + "\r\n";
-        head += "Content-Disposition: form-data; name=\"question\"\r\n\r\n\r\n";
-        head += "--" + boundary + "\r\n";
-        head += "Content-Disposition: form-data; name=\"file\"; filename=\"track.jpg\"\r\n";
-        head += "Content-Type: image/jpeg\r\n\r\n";
-        std::string tail = "\r\n--" + boundary + "--\r\n";
-        bool okw = true;
-        if (auto w = http->Write(head.c_str(), head.size()); !w) okw = false;
-        if (okw && !jpeg.empty()) {
-            if (auto w = http->Write((const char*)jpeg.data(), jpeg.size()); !w) okw = false;
-        }
-        if (okw) {
-            if (auto w = http->Write(tail.c_str(), tail.size()); !w) okw = false;
-        }
-        if (okw) {
-            if (auto w = http->Write("", 0); !w) okw = false;  // 结束 chunk
-        }
-        int status = 0;
-        if (auto sc = http->GetStatusCode()) status = sc.value();
-        std::string body = (status == 200) ? http->ReadAll() : std::string();
-        BridgeHttpSettle(http);
-        if (status != 200) {
-            if (++track_fail_ > 8) {
-                ESP_LOGW(TAG, "Tracking: bad status %d, auto stop", status);
-                tracking_ = false;
-            }
+        if (off) {  // 桥接侧跟踪已关（手动停/待机），就地自停
+            ESP_LOGI(TAG, "Tracking: bridge reports off, stop");
+            tracking_ = false;
             return;
         }
         track_fail_ = 0;
-        cJSON* root = cJSON_Parse(body.c_str());
-        if (root != nullptr) {
-            int target_pan = servo_angle_;
-            int target_tilt = tilt_angle_;
-            const cJSON* js = cJSON_GetObjectItem(root, "servo");
-            if (js && cJSON_IsNumber(js)) target_pan = js->valueint;
-            const cJSON* jt = cJSON_GetObjectItem(root, "tilt");
-            if (jt && cJSON_IsNumber(jt)) target_tilt = jt->valueint;
-            cJSON_Delete(root);
-            SmoothMoveTo(target_pan, target_tilt);
-        }
+        SmoothMoveTo(target_pan, target_tilt);
     }
 
     // 平滑逼近目标角度（2026-10-16）：每 20ms 各轴最多走 2°，把一帧跳 6°
@@ -1443,6 +1494,7 @@ private:
             vTaskDelay(pdMS_TO_TICKS(30));  // SmoothMoveTo 自带节拍，这里只留小间隙
         }
         self->esp_video_->SetCaptureDqbufCount(3);  // 恢复默认
+        self->StreamClose();                        // 关跟踪视频流连接
         // 归位到待机姿态（2026-10-17：100/80 正对主人常坐位，非机械中位）
         self->SetServoAngleDirect(CLAW_SERVO_HOME_PAN);
         self->SetTiltAngleDirect(CLAW_SERVO_HOME_TILT);
