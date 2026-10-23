@@ -2066,6 +2066,73 @@ private:
             });
 
         // --- Auto look: periodically describe what the camera sees ---
+        // --- Face tracking (2026-10-23): let 小智's cloud LLM drive the
+        // tracking switches directly through MCP tools. The bridge owns the
+        // real state (/tracking/start|stop + persisted flag); these tools
+        // just proxy to it, and the bridge pushes tracking on/off back to
+        // the device via the pending queue.
+        mcp_server.AddTool("self.tracking.start",
+            "START FACE TRACKING: the pan-tilt head continuously follows the "
+            "OWNER's face and keeps it centred (face recognition is on - it "
+            "only follows the owner and ignores other people). Requires the "
+            "bridge computer to be reachable. Use when the user asks to be "
+            "followed / looked at, e.g. 看着我 / 跟着我 / 开始跟随.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (!BridgeEnabled()) {
+                    return std::string("桥接电脑没开，跟踪启动不了。请直接告诉用户先开电脑上的桥接服务。");
+                }
+                std::string resp = BridgeHttpPostJson("/tracking/start", "{}");
+                if (resp.find("true") != std::string::npos) {
+                    ESP_LOGI(TAG, "Tracking start requested via MCP");
+                    return std::string("好，我开始盯着你了。请直接告诉用户：已经开始跟着你，只有你能让它跟着。");
+                }
+                ESP_LOGW(TAG, "Tracking start failed: %s", resp.c_str());
+                return std::string("跟踪没启动成功，请直接告诉用户稍后再试一次。");
+            });
+
+        mcp_server.AddTool("self.tracking.stop",
+            "STOP FACE TRACKING and return the head to the home pose (the "
+            "fixed angle that faces the owner's seat). Use when the user asks "
+            "to stop being followed or to stop watching, e.g. 别跟了 / "
+            "不要跟着我 / 停下.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (!BridgeEnabled()) {
+                    return std::string("桥接电脑没开，停止指令下发不了。请直接告诉用户先开电脑上的桥接服务。");
+                }
+                std::string resp = BridgeHttpPostJson("/tracking/stop", "{}");
+                if (resp.find("true") != std::string::npos) {
+                    ESP_LOGI(TAG, "Tracking stop requested via MCP");
+                    return std::string("好的，不跟了，头也转回到复位角度了。请直接告诉用户已经停止跟随。");
+                }
+                ESP_LOGW(TAG, "Tracking stop failed: %s", resp.c_str());
+                return std::string("停止指令没发出去，请直接告诉用户稍后再试一次。");
+            });
+
+        mcp_server.AddTool("self.tracking.status",
+            "Report whether FACE TRACKING is currently on, and whether the "
+            "device is actively following a face or idle/standby. Use when "
+            "the user asks 有没有在跟着我 / 跟踪开着吗.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                if (!BridgeEnabled()) {
+                    return std::string("桥接电脑没开，查不到跟踪状态。");
+                }
+                std::string body = BridgeHttpGet(bridge_url_ + "/tracking/status");
+                if (body.empty()) {
+                    return std::string("桥接没响应，查不到跟踪状态。请告诉用户稍后再问。");
+                }
+                bool enabled = body.find("\"enabled\":true") != std::string::npos ||
+                               body.find("\"enabled\": true") != std::string::npos;
+                bool active = body.find("\"active\":true") != std::string::npos ||
+                              body.find("\"active\": true") != std::string::npos;
+                if (enabled && active) {
+                    return std::string("跟踪开着，我正在跟着你。请直接这样告诉用户。");
+                }
+                if (enabled) {
+                    return std::string("跟踪开着，但暂时没看到人，处于待机等你的状态。请直接这样告诉用户。");
+                }
+                return std::string("跟踪现在是关着的。请直接这样告诉用户，并询问要不要打开。");
+            });
+
         mcp_server.AddTool("self.camera.auto_look",
             "Enable or disable PERIODIC LOOKING: every N minutes (while the "
             "device is idle) the device automatically takes a photo with its "
