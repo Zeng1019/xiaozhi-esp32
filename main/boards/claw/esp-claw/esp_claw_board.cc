@@ -139,6 +139,12 @@ private:
     std::atomic<bool> tracking_{false};
     int track_fail_ = 0;  // 连续上传失败计数，>8 次自动停止
     int stream_fd_ = -1;  // 跟踪视频流连接（-1 = 未连接）
+    // 舵机异步匀速跟随（2026-10-23）：跟踪闭环只更新目标角，另起任务
+    // 按 ~40°/s 匀速滑过去。原来 SmoothMoveTo 是同步阻塞的——舵机走完
+    // 才采下一帧，3fps 下每帧 6° 用 30ms 冲完、再干等 200ms，看着就是
+    // "一跳一停"。异步后采集不再等舵机，帧率与平滑度同时受益。
+    volatile int track_tgt_pan_ = 90;
+    volatile int track_tgt_tilt_ = 90;
 #else
     int servo_speed_ = 0;  // -100..100 percent, 0 = stopped
 #endif
@@ -1474,7 +1480,31 @@ private:
         // 排查帧率上限用（2026-10-17）：采集 vs 流传输分段耗时，稳定后删
         ESP_LOGI(TAG, "track: cap=%lldms stream=%lldms jpeg=%uB",
                  (t1-t0)/1000, (t2-t1)/1000, (unsigned)jpeg.size());
-        SmoothMoveTo(target_pan, target_tilt);
+        // 非阻塞：只更新目标角，由 ServoTrackTask 匀速滑过去（2026-10-23）
+        track_tgt_pan_ = target_pan;
+        track_tgt_tilt_ = target_tilt;
+    }
+
+    // 舵机匀速跟随任务（2026-10-23）：1°/25ms ≈ 40°/s。3fps 下每帧最多
+    // 6° 的步进正好铺满 ~150ms，运动连续；帧率再低也只是变慢、不跳步。
+    static void ServoTrackTask(void* arg) {
+        auto* self = static_cast<EspClawBoard*>(arg);
+        while (self->tracking_) {
+            int tp = self->track_tgt_pan_;
+            int tt = self->track_tgt_tilt_;
+            if (self->servo_angle_ < tp) {
+                self->SetServoAngleDirect(self->servo_angle_ + 1);
+            } else if (self->servo_angle_ > tp) {
+                self->SetServoAngleDirect(self->servo_angle_ - 1);
+            }
+            if (self->tilt_angle_ < tt) {
+                self->SetTiltAngleDirect(self->tilt_angle_ + 1);
+            } else if (self->tilt_angle_ > tt) {
+                self->SetTiltAngleDirect(self->tilt_angle_ - 1);
+            }
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        vTaskDelete(nullptr);
     }
 
     // 平滑逼近目标角度（2026-10-16）：每 10ms 各轴最多走 2°，把一帧跳 6°
@@ -1502,6 +1532,9 @@ private:
         self->esp_video_->SetCaptureDqbufCount(1);  // 低延迟：直取帧，省 ~300ms/次
         self->SetServoAngleDirect(CLAW_SERVO_HOME_PAN);
         self->SetTiltAngleDirect(CLAW_SERVO_HOME_TILT);
+        self->track_tgt_pan_ = CLAW_SERVO_HOME_PAN;
+        self->track_tgt_tilt_ = CLAW_SERVO_HOME_TILT;
+        xTaskCreate(ServoTrackTask, "servo_track", 3072, self, 2, nullptr);
         vTaskDelay(pdMS_TO_TICKS(400));
         while (self->tracking_) {
             self->TrackingStep();
