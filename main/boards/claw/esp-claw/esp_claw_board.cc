@@ -1658,7 +1658,10 @@ private:
         esp_task_wdt_add(nullptr);
         self->BridgeTouch();
         while (true) {
-            for (int i = 0; i < 10; ++i) {  // 10s tick，期间每秒喂 TWDT
+            // 2026-10-23：指令轮询从 10s 收紧到 1s——Dashboard 拖滑杆预览
+            // 停在 10s tick 上，用户体感"滑了好久舵机才动"。设备常供电，
+            // 局域网 1Hz GET 的开销可忽略；顺带播报/开关动作也更跟手。
+            {  // 1s tick（期间每秒喂 TWDT）
                 esp_task_wdt_reset();
                 // 派单后收线：见 bridge_close_session_ 注释。Speaking 状态
                 // （云端抢答 TTS 还在被 abort）等下一秒再看；Listening 立即
@@ -1684,7 +1687,7 @@ private:
             self->BridgeTouch();
             self->BridgePollPending();
             self->BridgeTouch();
-            if (++ticks >= 30) {  // every ~5 minutes
+            if (++ticks >= 300) {  // every ~5 minutes (1s tick × 300)
                 // Only clear the counter when we actually attempt the
                 // upload: a busy device (conversation / TTS) skips it and
                 // should retry on the next 10s tick instead of silently
